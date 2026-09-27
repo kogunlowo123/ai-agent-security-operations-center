@@ -41,7 +41,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0  # Full history for CHANGELOG generation
 
@@ -90,7 +90,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python with uv
         uses: ./.github/actions/setup-python
@@ -138,7 +138,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build and push ${{ matrix.image.name }} image
         id: build-push
@@ -176,7 +176,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
@@ -233,7 +233,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download Python dist artifacts
         uses: actions/download-artifact@v4
@@ -279,7 +279,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -333,7 +333,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
