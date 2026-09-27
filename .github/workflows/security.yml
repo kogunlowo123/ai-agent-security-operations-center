@@ -68,7 +68,7 @@ jobs:
           trivyignores: ".trivyignore"
 
       - name: Upload Trivy scan results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: "trivy-${{ matrix.image.name }}-results.sarif"
@@ -85,7 +85,7 @@ jobs:
           skip-dirs: ".git,node_modules,.venv,__pycache__"
 
       - name: Upload Trivy filesystem scan results
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: "trivy-fs-results.sarif"
@@ -125,7 +125,7 @@ jobs:
             || true  # Don't fail here; let SARIF upload handle severity gate
 
       - name: Upload Bandit SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: bandit-results.sarif
@@ -169,7 +169,7 @@ jobs:
           download_external_modules: false
 
       - name: Upload Checkov Terraform SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: checkov-terraform-results.sarif
@@ -185,7 +185,7 @@ jobs:
           soft_fail: true  # Docker checks are advisory
 
       - name: Upload Checkov Docker SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: checkov-docker-results.sarif
@@ -201,7 +201,7 @@ jobs:
           soft_fail: true
 
       - name: Upload Checkov GHA SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: checkov-gha-results.sarif
@@ -243,7 +243,7 @@ jobs:
             || true
 
       - name: Upload Semgrep SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: semgrep-results.sarif
