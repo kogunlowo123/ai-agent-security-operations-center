@@ -1,0 +1,41 @@
+apiVersion: v2
+name: soc-platform
+description: AI Agent Security Operations Center — Umbrella Chart (deploys all services)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - security
+  - soc
+  - platform
+  - umbrella
+home: https://github.com/acme-corp/ai-agent-security-operations-center
+sources:
+  - https://github.com/acme-corp/ai-agent-security-operations-center
+maintainers:
+  - name: Platform Engineering
+    email: platform-eng@acme-corp.com
+    url: https://acme-corp.com
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/changes: |
+    - Initial release of SOC Platform umbrella chart
+dependencies:
+  # SOC API
+  - name: soc-api
+    version: "0.1.0"
+    repository: "file://../api"
+    condition: soc-api.enabled
+
+  # Agent Runtime
+  - name: soc-agent-runtime
+    version: "0.1.0"
+    repository: "file://../agent-runtime"
+    condition: soc-agent-runtime.enabled
+
+  # OpenTelemetry Collector (upstream chart from opentelemetry-helm)
+  - name: opentelemetry-collector
+    version: "0.78.1"
+    repository: "https://open-telemetry.github.io/opentelemetry-helm-charts"
+    condition: opentelemetry-collector.enabled
+    alias: otel-collector

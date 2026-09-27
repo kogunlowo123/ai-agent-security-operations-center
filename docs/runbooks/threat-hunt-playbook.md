@@ -1,276 +1,280 @@
 # Threat Hunt Playbook
 
-**Version:** 1.3  
-**Owner:** Threat Intelligence & Hunting Team  
-**Last Updated:** 2024-12-01  
-**Review Cadence:** Quarterly  
+**Version:** 1.0  
+**Owner:** SOC Platform Team  
+**Last Updated:** 2024-01-20  
+**Applies To:** All proactive threat hunting activities using the AI Agent SOC platform
 
 ---
 
 ## Overview
 
-This playbook defines the structured methodology for conducting proactive threat hunts using the AI Agent SOC platform. Threat hunting is a proactive, iterative process that searches for threats that have evaded existing automated detections.
+Threat hunting is a proactive, hypothesis-driven process for finding evidence of threats that automated detections have not surfaced. This playbook covers the full threat hunt lifecycle: forming a hypothesis, executing SIEM queries, analysing results, and producing a report.
 
-**When to Hunt:**
-- After a CRITICAL or HIGH incident in the same tenant or sector
-- After a new MITRE ATT&CK technique is added relevant to our threat profile
-- When threat intelligence indicates a specific adversary is targeting our sector
-- On a scheduled cadence (weekly for high-risk asset groups, monthly for standard)
-- When posture score degrades below GOOD rating
+The SOC platform provides a dedicated threat hunt API at `/api/v1/hunt/`.
+
+---
+
+## Hunt Lifecycle
+
+```
+┌──────────────────┐
+│ 1. Hypothesis    │  Define what threat you're looking for
+│    Formation     │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 2. Hunt Launch   │  Submit hunt to the SOC platform
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 3. SIEM Query    │  AI agent generates and executes OpenSearch queries
+│    Execution     │  against event corpus
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 4. Analysis      │  Analyst reviews agent-generated findings
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 5. Report &      │  Document findings; escalate or close
+│    Escalation    │
+└──────────────────┘
+```
 
 ---
 
 ## Phase 1: Hypothesis Formation
 
-A hunt hypothesis is a falsifiable statement about adversary behaviour in the environment.
+A good hunt hypothesis follows the format:
 
-**Good hypothesis format:**
-> "Threat actor [X] is using technique [ATT&CK ID] to achieve [objective] by [mechanism]."
+> "I believe [threat actor / technique] is [performing action] by [observable evidence] because [threat intelligence / anomaly]."
 
-**Example hypotheses:**
-- "An attacker is performing credential dumping (T1003) from LSASS on domain controllers to enable lateral movement."
-- "A supply chain compromise (T1195) has introduced a malicious npm package that is beaconing to attacker infrastructure."
-- "A compromised insider (T1078) is staging sensitive data (T1074) in staging buckets for exfiltration."
+### Hypothesis Triggers
 
-**Hypothesis sources:**
-1. **AI Agent**: use the threat hunt agent to generate hypotheses based on current posture signals and threat intel
-2. **Threat Intel**: ISAC bulletins, vendor threat reports, recent CVE disclosures
-3. **ATT&CK Threat Groups**: review techniques used by threat groups targeting financial services (see MITRE Navigator layer `threat-intel/navigator-layers/fs-sector.json`)
-4. **Recent Incidents**: what did the last PIR recommend hunting for?
+Hunts are initiated when any of the following are observed:
 
-### 1.1 Create Hunt via API
+| Trigger | Example |
+|---------|---------|
+| New MITRE ATT&CK technique published relevant to AI agents | T1650 published covering LLM prompt injection |
+| Threat intel report implicating a technique against ML systems | Report of T1602 targeting ML model stores |
+| Anomaly in security posture score | Posture dropped from 87 → 71 over 48h |
+| Pattern observed in low-severity events not yet triggering incidents | Multiple T1078.004 events across different tenants |
+| Post-incident follow-up hunt | After INC-ABC123: hunt for lateral movement by same actor |
 
-```bash
-POST /api/v1/threat-hunts
-{
-  "hypothesis": "Pass-the-Hash lateral movement from compromised finance workstations to domain controllers using harvested NTLM hashes",
-  "mitre_technique": "T1550.002",
-  "threat_group": "APT40",
-  "scope": {
-    "timerange_hours": 168,
-    "asset_groups": ["domain-controllers", "finance-workstations"],
-    "cloud_providers": ["aws", "azure"]
-  },
-  "priority": "HIGH"
-}
-```
+### Hunt Types
+
+| Type | `hunt_type` value | Description |
+|------|-------------------|-------------|
+| Technique-based | `TECHNIQUE` | Hunt for a specific MITRE ATT&CK technique |
+| IOC-based | `IOC` | Hunt for specific indicators (IPs, hashes, domains) |
+| Anomaly-based | `ANOMALY` | Hunt for behavioural anomalies in agent telemetry |
+| Incident follow-up | `INCIDENT` | Deep-dive hunt connected to an existing incident |
 
 ---
 
-## Phase 2: SIEM Query Development
+## Phase 2: Hunt Launch
 
-### 2.1 Query Design Principles
+### 2.1 Via API
 
-- Always scope queries by `tenant_id` first to prevent cross-tenant data access
-- Use time-boxed queries — open-ended queries across all time are expensive and may miss recent activity
-- Start broad, then narrow: identify the data shape before applying strict filters
-- Preserve raw query text in hunt notes for reproducibility
+```bash
+# Launch a technique-based hunt
+curl -X POST https://soc.internal/api/v1/hunt/launch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Tenant-ID: $TENANT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hypothesis": "AI agents are performing privilege escalation via IAM role chaining after initial credential compromise",
+    "hunt_type": "TECHNIQUE",
+    "mitre_technique": "T1078.004",
+    "iocs": [],
+    "time_range_hours": 168,
+    "priority_principals": []
+  }'
+```
 
-### 2.2 Query Templates by Technique Category
+**Response:** HTTP 202 with `hunt_id` (format: `HUNT-XXXXXXXXXXXXXXXX`)
 
-**T1550.002 — Pass-the-Hash:**
 ```json
-GET soc-events-*/_search
 {
-  "query": {
-    "bool": {
-      "must": [
-        {"term": {"tenant_id": "<TENANT>"}},
-        {"term": {"event_type": "auth.login.success"}},
-        {"term": {"data.auth_method": "ntlm"}},
-        {"range": {"time": {"gte": "now-7d"}}}
-      ],
-      "filter": [
-        {"terms": {"data.destination_host": ["DC-PROD-01", "DC-PROD-02"]}}
-      ]
+  "hunt_id": "HUNT-A1B2C3D4E5F6",
+  "status": "PENDING",
+  "estimated_duration_seconds": 120,
+  "created_at": "2024-01-20T14:30:00Z"
+}
+```
+
+### 2.2 Hunt Parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `hypothesis` | Yes | Human-readable hypothesis (10–2000 characters) |
+| `hunt_type` | Yes | `TECHNIQUE`, `IOC`, `ANOMALY`, or `INCIDENT` |
+| `mitre_technique` | If TECHNIQUE | ATT&CK technique ID (e.g., `T1078.004`) |
+| `iocs` | If IOC | List of `{type, value}` objects |
+| `time_range_hours` | No | Look-back window; default 168h (7 days) |
+| `priority_principals` | No | Subset of agent IDs to focus on |
+
+### 2.3 Polling Hunt Status
+
+```bash
+# Poll until status is COMPLETED or FAILED
+while true; do
+  STATUS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    https://soc.internal/api/v1/hunt/$HUNT_ID | jq -r .status)
+  echo "Status: $STATUS"
+  [ "$STATUS" = "COMPLETED" ] || [ "$STATUS" = "FAILED" ] && break
+  sleep 10
+done
+```
+
+---
+
+## Phase 3: SIEM Query Execution
+
+The SOC agent automatically generates OpenSearch DSL queries based on the hypothesis and executes them against the event corpus. The analyst does not need to write raw queries.
+
+### 3.1 What the Agent Does
+
+1. **Technique mapping**: Retrieves MITRE ATT&CK technique details from the RAG corpus.
+2. **Query generation**: Generates OpenSearch DSL queries targeting event fields most likely to surface the technique.
+3. **Query execution**: Runs queries against the `soc-events-*` indices.
+4. **Aggregation**: Groups results by `principal_id`, `source_repo`, and time buckets.
+
+### 3.2 Manual Query Override
+
+For advanced analysts who want to execute custom queries:
+
+```bash
+# Execute a custom OpenSearch query as part of the hunt
+curl -X POST https://soc.internal/api/v1/hunt/$HUNT_ID/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "query": {
+      "bool": {
+        "must": [
+          {"term": {"data.severity": "HIGH"}},
+          {"wildcard": {"data.payload.action": "*AssumeRole*"}},
+          {"range": {"time": {"gte": "now-7d"}}}
+        ]
+      }
     }
-  },
-  "aggs": {
-    "by_source_host": {"terms": {"field": "data.source_host.keyword", "size": 50}}
-  }
-}
-```
-
-**T1003.001 — LSASS Memory Dump:**
-```json
-GET soc-events-*/_search
-{
-  "query": {
-    "bool": {
-      "must": [
-        {"term": {"tenant_id": "<TENANT>"}},
-        {"term": {"event_type": "process.create"}},
-        {"term": {"data.target_process": "lsass.exe"}},
-        {"range": {"time": {"gte": "now-7d"}}}
-      ]
-    }
-  }
-}
-```
-
-**T1041 — Exfiltration over C2 Channel (large outbound transfers):**
-```json
-GET soc-events-*/_search
-{
-  "query": {
-    "bool": {
-      "must": [
-        {"term": {"tenant_id": "<TENANT>"}},
-        {"term": {"event_type": "network.anomaly.detected"}},
-        {"range": {"data.bytes_transferred": {"gte": 104857600}}},
-        {"range": {"time": {"gte": "now-7d"}}}
-      ]
-    }
-  },
-  "sort": [{"data.bytes_transferred": "desc"}]
-}
-```
-
-### 2.3 Launch Hunt Query via CLI
-
-```bash
-soc-cli hunt query \
-  --hunt-id <HUNT-ID> \
-  --query-file queries/hunt-T1550.002.json \
-  --save-results
+  }'
 ```
 
 ---
 
-## Phase 3: Data Collection and Analysis
+## Phase 4: Analysis
 
-### 3.1 Collect Evidence
-
-For each query result set:
-
-1. **Review top 20 results** manually — look for patterns the automated ranking may have missed
-2. **Entity enrichment**: use the platform's enrichment API to get threat intel context for any external IPs, domains, or file hashes
-3. **Timeline reconstruction**: order events chronologically to understand the attack progression
-4. **Lateral movement mapping**: visualise host-to-host connections using the graph view
+### 4.1 Retrieve Hunt Results
 
 ```bash
-# Enrich an IP address against threat intel
-soc-cli intel enrich --type ip --value 203.0.113.5
-
-# Enrich a file hash
-soc-cli intel enrich --type sha256 --value <HASH>
+curl -H "Authorization: Bearer $TOKEN" \
+  https://soc.internal/api/v1/hunt/$HUNT_ID/results | jq .
 ```
 
-### 3.2 True Positive Confirmation Criteria
+The results contain:
+- `findings`: List of suspicious events with confidence scores
+- `affected_principals`: List of agent IDs with finding counts
+- `mitre_techniques_confirmed`: Techniques with evidence above the confidence threshold
+- `timeline`: Chronological sequence of suspicious events
+- `agent_analysis`: Natural language summary from the SOC agent
 
-A finding is a **confirmed True Positive** when:
+### 4.2 Analyst Review Criteria
 
-- [ ] The anomalous behaviour matches the ATT&CK technique's known implementation
-- [ ] At least two independent data sources confirm the activity (e.g., EDR + network logs)
-- [ ] The activity cannot be explained by an authorised change record or scheduled task
-- [ ] The confidence score from the AI triage agent is ≥ 0.80
+For each finding, the analyst should assess:
 
-A finding is a **False Positive** when:
+1. **Confidence score**: Is the agent's confidence justified by the evidence?
+2. **False positive check**: Is there a legitimate explanation (authorized maintenance, known scanner)?
+3. **Blast radius**: If this is a True Positive, how many principals/systems are affected?
+4. **Novelty**: Does this match known attack patterns, or does it represent a new technique variant?
 
-- [ ] The activity matches an authorised change record (check ServiceNow)
-- [ ] The source is a known scanner or automation account (check the allowlist)
-- [ ] The signature matches but the context (time, user, system) is consistent with normal operations
+### 4.3 Decision Outcomes
 
-### 3.3 Pivot Investigation
-
-When a True Positive is confirmed:
-
-1. **Pivot by entity**: search for all activity by the compromised account/host in the last 30 days
-2. **Pivot by IOC**: search for the identified IP/domain/hash across all tenants (platform-wide hunt, requires elevated privileges)
-3. **Temporal expansion**: extend the time window backwards to find the initial access vector
+| Finding | Action |
+|---------|--------|
+| Confirmed True Positive | Create incident(s) via POST `/api/v1/incidents`; link to hunt |
+| Likely True Positive (confidence 0.6–0.85) | Create incident with `verdict: NEEDS_REVIEW`; assign senior analyst |
+| False Positive | Document rationale; consider creating a suppression rule |
+| Inconclusive | Mark hunt as `ESCALATED`; widen time range or consult threat intel |
 
 ---
 
-## Phase 4: Reporting
+## Phase 5: Report & Escalation
 
-### 4.1 Hunt Report Structure
+### 5.1 Hunt Report Structure
 
-Every completed hunt must produce a hunt report following this structure:
-
-1. **Executive Summary** (3–5 sentences): What was hunted, what was found, recommended action
-2. **Hypothesis**: The original hunt hypothesis and whether it was validated
-3. **Methodology**: Queries run, data sources used, time period covered
-4. **Findings**: 
-   - Confirmed True Positives (with ATT&CK mapping)
-   - Notable False Positives (for false positive registry update)
-   - Negative findings (evidence the hypothesis was NOT validated)
-5. **MITRE ATT&CK Coverage**: Heatmap delta — which techniques now have better coverage
-6. **Recommendations**: 
-   - New detection rules to create
-   - Posture improvements
-   - Follow-on hunts
-7. **IOC List**: IPs, domains, file hashes, registry keys found during the hunt
-
-### 4.2 Submit Hunt Report
+Every completed hunt must produce a report stored in the SOC platform:
 
 ```bash
-# Update hunt status to COMPLETED and attach report
-PATCH /api/v1/threat-hunts/<HUNT-ID>
-{
-  "status": "COMPLETED",
-  "verdict": "TRUE_POSITIVE",
-  "findings_count": 3,
-  "mitre_technique_confirmed": "T1550.002",
-  "report_s3_key": "s3://soc-hunt-reports/<HUNT-ID>/report.md"
-}
+curl -X POST https://soc.internal/api/v1/hunt/$HUNT_ID/report \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "executive_summary": "Hunt for T1078.004 over the past 7 days identified 3 suspicious IAM role assumption chains...",
+    "findings_summary": "3 TRUE_POSITIVE findings involving agents prod-042, prod-108, and staging-017",
+    "affected_systems": ["ai-agent-identity-governance", "ai-agent-policy-enforcement"],
+    "incidents_created": ["INC-XY001", "INC-XY002"],
+    "false_positives": 2,
+    "recommendations": [
+      "Implement MFA on all agent IAM roles",
+      "Add detection rule for >2 AssumeRole calls within 60 seconds"
+    ],
+    "hunt_outcome": "TRUE_POSITIVE"
+  }'
 ```
 
-### 4.3 Feed Findings into Detection Engineering
+### 5.2 Escalation Criteria
 
-For each confirmed True Positive:
+Escalate the hunt immediately to the SOC Lead if:
+- More than 3 principals are affected
+- The technique spans multiple source repositories (cross-system attack)
+- There is evidence of data exfiltration
+- The incident SLA is at risk
 
-1. Open a detection engineering ticket in Jira: `DE-BOARD` with label `hunt-finding`
-2. Reference the hunt ID and ATT&CK technique
-3. Specify the recommended detection logic (Sigma rule, SIEM query, or EDR policy)
-4. Target: detection rule in production within 5 business days for CRITICAL findings, 10 days for HIGH
+### 5.3 Post-Hunt Actions
+
+- [ ] Findings documented in hunt report
+- [ ] Related incidents created and linked
+- [ ] New detection rules proposed (if applicable)
+- [ ] Hunt status set to `COMPLETED` or `ESCALATED`
+- [ ] MITRE ATT&CK coverage matrix updated
+- [ ] Posture score refreshed
 
 ---
 
-## Phase 5: Posture and Coverage Update
+## Pre-Built Hunt Templates
 
-### 5.1 Update ATT&CK Coverage Matrix
+The following hypothesis templates are available for common AI agent threat scenarios:
 
-After each hunt, update the coverage heatmap:
-
-```bash
-soc-cli coverage update \
-  --technique T1550.002 \
-  --status detected \
-  --hunt-id <HUNT-ID> \
-  --confidence high
+### Template: IAM Role Chaining (T1078.004)
+```
+AI agents in the [SOURCE_REPO] repository are performing privilege escalation via 
+IAM role chaining, obtaining elevated permissions not granted in their service 
+principal definition, as evidenced by AssumeRole API calls creating chains 
+longer than 2 hops.
 ```
 
-### 5.2 Posture Score Contribution
-
-Completed hunts with negative findings (hypothesis not validated) contribute positively to the posture score by increasing ATT&CK coverage confidence. Configure this in the posture scoring engine:
-
-```yaml
-# platform/config/posture-weights.yaml
-hunt_coverage_bonus:
-  per_technique_validated: 0.5  # +0.5 points per validated hunt
-  max_bonus: 10.0               # cap at 10 points
+### Template: Model Supply Chain Tampering (T1195.002)
+```
+A threat actor has tampered with a machine learning model artifact in the 
+[MODEL_STORE] repository, injecting adversarial weights or backdoors that 
+cause downstream AI agents to exhibit manipulated behaviour on specific trigger inputs.
 ```
 
----
+### Template: Prompt Injection via User Input (T1059.007)
+```
+External users are injecting malicious instructions into AI agent prompts via 
+the [INTERFACE] interface, causing agents to perform actions outside their 
+authorised scope, including data retrieval and API calls to unauthorized endpoints.
+```
 
-## Hunt Scheduling
-
-Automated hunt schedule (configurable per tenant):
-
-| Frequency | Techniques | Priority |
-|---|---|---|
-| Weekly | T1003, T1550, T1078, T1059 | HIGH |
-| Bi-weekly | T1190, T1566, T1195 | MEDIUM |
-| Monthly | All remaining ATT&CK techniques in sector profile | LOW |
-
-To schedule a recurring hunt:
-
-```bash
-POST /api/v1/threat-hunts/schedule
-{
-  "schedule": "0 6 * * MON",
-  "hypothesis": "Weekly credential dumping hunt on domain controllers",
-  "mitre_technique": "T1003",
-  "scope": {"asset_groups": ["domain-controllers"], "timerange_hours": 168}
-}
+### Template: Credential Theft from Agent Environment (T1552)
+```
+An attacker has compromised the runtime environment of an AI agent and is 
+extracting credentials (API keys, AWS credentials, database passwords) from 
+environment variables, container metadata endpoints, or secret stores.
 ```

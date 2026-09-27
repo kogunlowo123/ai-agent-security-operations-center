@@ -1,130 +1,138 @@
 # ADR 0003: CloudEvents-Based Event-Driven Ingestion Architecture
 
 **Status:** Accepted  
-**Date:** 2024-12-01  
+**Date:** 2024-02-01  
 **Deciders:** Platform Engineering, Security Architecture  
-**Supersedes:** N/A  
-**Superseded by:** N/A
+**Supersedes:** N/A
 
 ---
 
 ## Context
 
-The SOC platform ingests security telemetry from dozens of sources: cloud provider audit logs, identity providers, EDR agents, network sensors, CI/CD pipelines, and custom application instrumentation. At current scale this is approximately:
+The SOC platform must ingest security telemetry from nine source repositories spanning identity governance, policy enforcement, runtime monitoring, supply chain security, service mesh observability, SDLC integrity, model security, multi-cloud compliance, and network security. Each source repository emits security-relevant events at different rates, in different formats, and with different reliability characteristics.
 
-- **Peak ingestion rate**: 85,000 events/second (projected 200,000/s in 18 months)
-- **Average event size**: 1.2 KB
-- **Median ingestion latency requirement**: ≤10 s from event emission to SIEM availability
-- **P99 latency requirement**: ≤30 s
-- **Sources**: 47 distinct source types across 3 cloud providers
+Key requirements:
+- **Schema evolution**: Source repositories evolve independently; the ingest pipeline must tolerate schema additions without breaking.
+- **Back-pressure**: A compromised agent may flood the pipeline with millions of events; the ingest layer must protect downstream processors.
+- **Delivery guarantees**: CRITICAL severity events must not be lost even during downstream processing failures.
+- **Multi-tenancy**: Events from different customer tenants must be isolated at the ingestion layer — a tenant A event must never be processed by tenant B's pipeline.
+- **Auditability**: Every event ingested must be traceable from source to incident (or dismissal), with a complete audit trail.
+- **Cross-cloud compatibility**: Sources running on AWS, Azure, and GCP must be able to emit events using a single protocol without cloud-specific SDKs.
 
-The previous architecture used a pull-based polling model: each source was polled on a schedule (30 s – 5 min intervals depending on source type). This introduced:
-1. Detection latency directly proportional to poll interval.
-2. "N+1" polling fan-out as new sources were onboarded.
-3. Schema heterogeneity: each source had a bespoke payload schema, requiring per-source ETL.
-4. No standard for mandatory event metadata (source attribution, time, tenant scoping).
-
-We evaluated:
-
-| Option | Notes | Decision |
-|---|---|---|
-| Polling (current) | Simple but high latency | Rejected |
-| Proprietary push webhooks | Per-vendor schema divergence | Rejected |
-| Apache Kafka (self-managed) | High ops burden, overkill at current scale | Rejected |
-| **CloudEvents v1.0 + SQS/Kinesis** | Open standard, AWS-native scaling | **Selected** |
-| OCSF (Open Cybersecurity Schema Framework) | Good schema, but no transport standard | Partial adoption (OCSF for normalised schema inside CloudEvent `data`) |
+---
 
 ## Decision
 
-Adopt **CloudEvents v1.0** as the mandatory envelope schema for all events entering the SOC platform. Use **Amazon Kinesis Data Streams** as the primary transport and **Amazon SQS** for agent job queues.
+**Adopt the CloudEvents v1.0 specification** as the canonical event envelope format for all SOC ingest traffic, with AWS SQS as the durable queue backing the ingest pipeline.
 
-### CloudEvents Envelope
+### Protocol
 
-Every event entering the platform must conform to CloudEvents v1.0:
+All source repositories emit events as CloudEvents v1.0 JSON objects delivered over HTTPS to the SOC ingest endpoint (`POST /api/v1/events/ingest`). The CloudEvents envelope provides:
 
-```json
-{
-  "specversion": "1.0",
-  "id": "<uuid-v4>",
-  "source": "github.com/acme-corp/backend",
-  "type": "identity.access.violation",
-  "tenant_id": "<tenant-uuid>",
-  "datacontenttype": "application/json",
-  "time": "2024-12-01T14:32:11.000Z",
-  "data": {
-    "severity": "CRITICAL",
-    "actor": "svc-account@example.com",
-    "resource": "arn:aws:iam:::role/AdminRole",
-    "description": "..."
-  }
-}
-```
+- `specversion`: Always `"1.0"`
+- `id`: UUID v4, used for idempotent deduplication (events with a previously seen `id` are dropped with HTTP 200)
+- `source`: Identifies the emitting repository (e.g., `"ai-agent-identity-governance/v1"`)
+- `type`: Hierarchical event type following the reverse-DNS convention (e.g., `"identity.access.violation"`, `"runtime.anomaly.detected"`)
+- `time`: RFC 3339 timestamp of when the event occurred at source (not when it was received)
+- `datacontenttype`: `"application/json"`
+- `data`: Event-specific payload conforming to the source repository's schema
 
-Required attributes beyond the CloudEvents core spec:
-- `tenant_id` (extension): multi-tenancy isolation key — validated against caller's JWT.
-- `type` (must be in registered event type registry — see `platform/registry/event_types.yaml`).
-- `source` (must be in registered source registry — see `platform/registry/sources.yaml`).
+### Canonical Event Schema Extension Attributes
 
-### Transport Architecture
+The following CloudEvents extension attributes are required by the SOC platform:
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `tenantid` | string | Yes | Customer tenant identifier for multi-tenant isolation |
+| `severity` | string | Yes | `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` |
+| `sourcerepo` | string | Yes | Short name of the source repository |
+| `principalid` | string | No | AI agent or user identity that triggered the event |
+
+### Ingest Pipeline
 
 ```
-Source → CloudEvents HTTP POST → API Gateway → Kinesis Data Streams
-                                                     │
-                                          ┌──────────┴──────────┐
-                                          │   Kinesis Consumer   │
-                                          │  (Lambda / EKS pod)  │
-                                          └──────────┬──────────┘
-                                                     │
-                                     ┌───────────────┼───────────────┐
-                                     │               │               │
-                                 OpenSearch       SQS Queue       DynamoDB
-                                 (SIEM store)   (Agent jobs)    (Incident DB)
+Source Repo            SOC API              SQS                Event Processor
+    │                    │                   │                        │
+    │  POST /events/ingest│                   │                        │
+    │ ──────────────────► │                   │                        │
+    │                    │ Validate schema     │                        │
+    │                    │ Extract tenant_id   │                        │
+    │                    │ Deduplicate by id   │                        │
+    │                    │ ──────────────────► │                        │
+    │  HTTP 200 + event_id│ SQS SendMessage    │                        │
+    │ ◄────────────────── │                   │  SQS ReceiveMessage    │
+    │                    │                   │ ──────────────────────► │
+    │                    │                   │                   Enrich + Triage
+    │                    │                   │                   MITRE RAG
+    │                    │                   │                   Create Incident
+    │                    │                   │  DeleteMessage         │
+    │                    │                   │ ◄────────────────────── │
 ```
 
-- **Kinesis Data Streams**: 24-hour retention, 1,000 shards (auto-scaled based on ingestion rate). Shard key = `tenant_id` to ensure per-tenant ordering.
-- **SQS FIFO Queue** for agent job dispatch (threat hunt, triage): exactly-once delivery, deduplication by `event_id`.
-- **API Gateway** validates CloudEvents envelope schema before forwarding to Kinesis. Invalid events return 422 with field-level error details. Invalid source or type returns 422 (not 400 — schema validation failure, not auth failure).
+### SQS Configuration
+
+- **Queue type**: Standard (at-least-once delivery)
+- **Visibility timeout**: 120 seconds (covers 2× worst-case processing time)
+- **Message retention**: 4 days
+- **DLQ**: Separate dead-letter queue (`soc-ingest-dlq`) with retention 14 days; alerts fire if DLQ depth > 0
+- **Deduplication**: Implemented at the API layer using a Redis cache of recent event IDs (TTL: 24 hours). SQS Standard queue does not guarantee exactly-once delivery; the processor is idempotent.
+- **Message attributes**: `TenantId` and `Severity` are set as SQS message attributes to enable per-tenant and per-severity queue policies in the future without re-parsing the body.
+
+### Back-pressure
+
+The SQS queue provides natural back-pressure. The event processor scales horizontally via ECS auto-scaling based on the `ApproximateNumberOfMessagesVisible` CloudWatch metric. Maximum concurrency is capped at 50 ECS tasks to prevent overwhelming the PostgreSQL and OpenSearch backends.
 
 ### Schema Validation
 
-The ingestion API validates:
-1. CloudEvents core required fields (specversion, id, source, type, time, datacontenttype).
-2. `tenant_id` extension matches the caller's JWT claim.
-3. `type` is in the registered event type registry.
-4. `source` is in the registered source registry.
-5. `data` content-type matches `datacontenttype`.
+CloudEvent schema validation is performed at the API layer using `pydantic` v2 models. Invalid events (missing required fields, wrong types) are rejected with HTTP 422 and never enter the queue. Validation errors are logged with the raw payload for forensic analysis.
 
-Validation failures are logged to a dead-letter stream (`soc-invalid-events-dlq`) with the rejection reason for debugging.
-
-### Normalisation (OCSF)
-
-Inside the `data` field, all events are normalised to **Open Cybersecurity Schema Framework (OCSF)** class schemas (e.g. class 3002 for Authentication events). This normalisation happens at the Kinesis consumer stage, not at ingestion — the raw CloudEvent is stored unchanged in the DLQ and in a raw S3 archive, preserving forensic fidelity.
+---
 
 ## Consequences
 
 ### Positive
-- **Latency**: median event-to-SIEM latency drops from ~90 s (polling) to <10 s (push + streaming).
-- **Extensibility**: new event sources onboard by registering a `source` entry and mapping to a CloudEvents translator — no changes to the consumer pipeline.
-- **Schema contract**: the CloudEvents envelope enforces minimum metadata (time, source, type, tenant_id) at the API boundary — downstream consumers can depend on these fields.
-- **Vendor portability**: CloudEvents is a CNCF standard. If we migrate from Kinesis to Azure Event Hub or Pub/Sub, the event schema is unchanged.
-- **Audit trail**: every event has a globally unique `id` (UUID v4), enabling correlation across log systems.
 
-### Negative / Risks
-- **Source onboarding cost**: 47 existing sources must be wrapped with a CloudEvents adapter. Estimated effort: 2 weeks per engineer for 3 engineers.
-  - Mitigated by: SDK provided in `platform/sdk/python/` and `platform/sdk/go/` with CloudEvents helpers.
-- **Kinesis shard management**: over-sharding wastes cost; under-sharding causes throttling.
-  - Mitigated by: auto-scaling policy triggered on `IncomingRecords` CloudWatch metric; alert at 70% shard utilisation.
-- **SQS FIFO throughput limit**: 3,000 TPS per queue.
-  - Mitigated by: per-tenant SQS FIFO queue for high-volume tenants; shared queue for low-volume tenants.
-- **CloudEvents 1.0 does not encrypt data fields**: PII may be present in `data`.
-  - Mitigated by: TLS in transit (mandatory); PII scanner at Kinesis consumer removes/tags PII before OpenSearch indexing; raw events in S3 encrypted at rest with KMS CMK.
+- **Cloud-agnostic**: Sources on any cloud can emit CloudEvents over HTTPS without cloud-specific SDKs. Azure Event Grid and GCP Pub/Sub natively support CloudEvents.
+- **Decoupled**: The ingest API and event processor are independently deployable and scalable.
+- **Durable**: SQS persists messages for 4 days; events survive processor outages.
+- **Back-pressure resilient**: Message accumulation in SQS protects downstream processors; the API remains responsive during spikes.
+- **Idempotent**: UUID-based deduplication prevents duplicate incident creation from retry storms.
+- **Observable**: Every event gets a unique `event_id` returned to the caller, enabling end-to-end tracing from source to incident via the `X-Correlation-ID` header.
+
+### Negative
+
+- **At-least-once semantics**: Events may be processed more than once during SQS visibility timeout races. All processors must be idempotent (enforced via database unique constraints on `event_id`).
+- **No strict ordering**: SQS Standard does not guarantee FIFO ordering. Events from the same agent may be processed out of order. Acceptable for SOC use cases where event order is tracked via the `time` field, not processing order.
+- **Polling overhead**: SQS long polling (20s) means up to 20-second latency from event receipt to processor start. Acceptable for SOC; sub-second detection is handled by the streaming analytics pipeline (separate ADR).
+- **CloudEvents adoption burden**: Source repositories must adopt the CloudEvents SDK or envelope format. Mitigated by providing a thin wrapper library (`packages/soc-event-emitter`) that handles envelope construction.
 
 ### Neutral
-- OCSF normalisation is applied post-ingestion. Some downstream consumers (e.g., legacy SIEM integrations) still receive raw CloudEvent `data` payloads and handle normalisation themselves.
-- CloudEvents HTTP binding is used for all sources. Binary content mode is not used (all payloads are JSON).
 
-## Review Date
+- The CloudEvents `type` field is used for routing rules in the processor — different event types trigger different enrichment and triage logic.
+- Future consideration: migrate high-volume event types to Amazon Kinesis for sub-second latency if the 20-second SQS polling latency proves insufficient.
 
-This ADR is subject to review when ingestion rate consistently exceeds 150,000 events/second (Kinesis scaling evaluation required) or when CloudEvents v2.0 is ratified by CNCF.
+---
 
-Next scheduled review: 2025-06-01.
+## Alternatives Considered
+
+### Option A: Direct HTTP from source to processor (rejected)
+No message durability. A processor restart loses all in-flight events. Back-pressure requires complex rate limiting at the API layer.
+
+### Option B: Apache Kafka (rejected)
+Kafka provides better ordering guarantees and replay capability, but requires significant operational overhead (cluster management, ZooKeeper/KRaft, schema registry). At current event volumes (<10k/day), Kafka's operational cost outweighs its benefits. Re-evaluate if volume exceeds 1M events/day.
+
+### Option C: AWS EventBridge (rejected)
+EventBridge natively supports CloudEvents routing but has a 256 KB event size limit, which conflicts with certain AI agent telemetry payloads (model input/output logs can be large). Also, EventBridge has higher per-event costs at scale than SQS.
+
+### Option D: Proprietary binary protocol (rejected)
+A custom binary protocol would reduce bandwidth but breaks cloud-agnostic compatibility and increases SDK maintenance burden for nine source repositories.
+
+---
+
+## References
+
+- [CloudEvents Specification v1.0](https://cloudevents.io/specification/)
+- [AWS SQS Developer Guide](https://docs.aws.amazon.com/sqs/)
+- [CloudEvents SDK for Python](https://github.com/cloudevents/sdk-python)
+- ADR 0001: Multi-Cloud SOC Architecture
+- ADR 0002: MITRE ATT&CK RAG Corpus

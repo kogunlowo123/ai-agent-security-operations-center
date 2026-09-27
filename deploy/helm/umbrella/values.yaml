@@ -1,0 +1,243 @@
+# Umbrella chart values for the full SOC Platform.
+# Override per-environment using values-staging.yaml, values-production.yaml, etc.
+#
+# Usage:
+#   helm dependency update deploy/helm/umbrella
+#   helm upgrade --install soc-platform deploy/helm/umbrella \
+#     --namespace soc-platform \
+#     --create-namespace \
+#     -f deploy/helm/umbrella/values.yaml \
+#     -f deploy/helm/umbrella/values-production.yaml \
+#     --set soc-api.image.tag=v1.2.3 \
+#     --set soc-agent-runtime.image.tag=v1.2.3
+
+# ---------------------------------------------------------------------------
+# Global settings (propagated to all sub-charts)
+# ---------------------------------------------------------------------------
+global:
+  # Container image registry prefix (empty = use each chart's default)
+  imageRegistry: "ghcr.io"
+
+  # Image pull secrets — applied to all pods
+  imagePullSecrets:
+    - name: ghcr-pull-secret
+
+  # Default storage class for PVCs
+  storageClass: "gp3"
+
+  # Platform-wide labels added to all resources
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    platform: ai-agent-soc
+    environment: production
+
+  # Tenant ID placeholder — override per deployment for single-tenant mode
+  tenantId: ""
+
+# ---------------------------------------------------------------------------
+# SOC API sub-chart
+# ---------------------------------------------------------------------------
+soc-api:
+  enabled: true
+
+  replicaCount: 3
+
+  image:
+    tag: "latest"  # Override via CI: --set soc-api.image.tag=<git-sha>
+
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 15
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+
+  ingress:
+    enabled: true
+    hosts:
+      - host: api.soc.acme-corp.com
+        paths:
+          - path: /api/v1
+            pathType: Prefix
+    tls:
+      - secretName: soc-api-tls
+        hosts:
+          - api.soc.acme-corp.com
+
+  env:
+    - name: APP_ENV
+      value: "production"
+    - name: WORKERS
+      value: "4"
+    - name: LOG_LEVEL
+      value: "INFO"
+
+# ---------------------------------------------------------------------------
+# Agent Runtime sub-chart
+# ---------------------------------------------------------------------------
+soc-agent-runtime:
+  enabled: true
+
+  replicaCount: 2
+
+  image:
+    tag: "latest"  # Override via CI
+
+  agents:
+    triage:
+      enabled: true
+      replicas: 3
+      model: "claude-sonnet-4-6"
+      maxConcurrentJobs: 15
+    threatHunt:
+      enabled: true
+      replicas: 2
+      model: "claude-opus-4-5"
+      maxConcurrentJobs: 5
+    posture:
+      enabled: true
+      replicas: 1
+      model: "claude-haiku-4-5"
+      scheduleIntervalMinutes: 15
+
+  autoscaling:
+    enabled: true
+    keda:
+      enabled: true
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2000m"
+      memory: "4Gi"
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry Collector (official upstream chart)
+# ---------------------------------------------------------------------------
+opentelemetry-collector:
+  enabled: true
+
+  mode: deployment  # "deployment" or "daemonset"
+
+  replicaCount: 2
+
+  image:
+    repository: otel/opentelemetry-collector-contrib
+    tag: "0.92.0"
+
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
+  # Mount our custom collector config
+  configMap:
+    create: true
+    existingName: ""
+
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: "0.0.0.0:4317"
+          http:
+            endpoint: "0.0.0.0:4318"
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 512
+        spike_limit_mib: 128
+      batch:
+        send_batch_size: 1000
+        timeout: 5s
+
+    exporters:
+      otlp:
+        endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-otel-backend:4317}"
+        tls:
+          insecure: true
+      debug:
+        verbosity: basic
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlp, debug]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlp, debug]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlp, debug]
+
+  service:
+    type: ClusterIP
+
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8888"
+
+# ---------------------------------------------------------------------------
+# Shared platform configuration
+# ---------------------------------------------------------------------------
+platform:
+  # AWS region for all AWS SDK calls
+  awsRegion: "us-east-1"
+
+  # OpenSearch cluster endpoint
+  opensearch:
+    endpoint: ""  # Set via ExternalSecret
+    indexPrefix: "soc"
+    replicaCount: 1
+    shards: 5
+
+  # PostgreSQL connection (managed via RDS)
+  database:
+    host: ""       # Set via ExternalSecret
+    port: 5432
+    name: "soc_platform"
+    poolSize: 20
+    maxOverflow: 10
+
+  # SQS queue configuration
+  sqs:
+    triageQueue: ""    # Set via ExternalSecret
+    huntQueue: ""      # Set via ExternalSecret
+
+  # Anthropic API configuration
+  anthropic:
+    baseUrl: "https://api.anthropic.com"
+    apiVersion: "2023-06-01"
+    maxRetries: 3
+    timeoutSeconds: 60
+    promptCaching:
+      enabled: true
+
+  # Multi-tenancy
+  multiTenancy:
+    enabled: true
+    isolationLevel: "namespace"  # namespace | label
+
+  # Feature flags
+  features:
+    piiScrubbing: true
+    crossCloudCorrelation: true
+    adaptiveTriage: true
+    autoContainment: false  # Requires explicit enablement per tenant

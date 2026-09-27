@@ -1,32 +1,192 @@
+---
+# ArgoCD App-of-Apps
+# Manages all SOC platform services as a single root Application.
+# Deploy this file to bootstrap the entire platform:
+#   kubectl apply -f deploy/argocd/app-of-apps.yaml -n argocd
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: ai-soc-app-of-apps
+  name: soc-platform
   namespace: argocd
+  labels:
+    app.kubernetes.io/name: soc-platform
+    app.kubernetes.io/part-of: ai-agent-soc
+    environment: production
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: "argocd-deployments"
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: "soc-alerts"
   finalizers:
     - resources-finalizer.argocd.argoproj.io
-  labels:
-    app.kubernetes.io/name: ai-soc-app-of-apps
-    app.kubernetes.io/part-of: ai-agent-soc
 spec:
-  project: default
+  project: soc-platform
   source:
-    repoURL: https://github.com/kogunlowo123/ai-agent-security-operations-center.git
-    targetRevision: main
+    repoURL: https://github.com/acme-corp/ai-agent-security-operations-center
+    targetRevision: HEAD
     path: deploy/argocd/apps
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd
   syncPolicy:
     automated:
+      prune: false        # Never auto-prune child apps — require explicit deletion
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+  revisionHistoryLimit: 10
+
+---
+# Child Application: SOC API
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: soc-api
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: soc-api
+    app.kubernetes.io/part-of: ai-agent-soc
+    tier: api
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: soc-platform
+  source:
+    repoURL: https://github.com/acme-corp/ai-agent-security-operations-center
+    targetRevision: HEAD
+    path: deploy/helm/api
+    helm:
+      releaseName: soc-api
+      valueFiles:
+        - values.yaml
+        - values-production.yaml
+      parameters:
+        - name: image.tag
+          value: "WILL_BE_REPLACED_BY_CI"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: soc-platform
+  syncPolicy:
+    automated:
       prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
-      - PrunePropagationPolicy=foreground
+      - ServerSideApply=true
     retry:
-      limit: 5
+      limit: 3
       backoff:
         duration: 5s
         factor: 2
-        maxDuration: 3m
+        maxDuration: 1m
+  revisionHistoryLimit: 5
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas  # Managed by HPA
+
+---
+# Child Application: Agent Runtime
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: soc-agent-runtime
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: soc-agent-runtime
+    app.kubernetes.io/part-of: ai-agent-soc
+    tier: agents
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: soc-platform
+  source:
+    repoURL: https://github.com/acme-corp/ai-agent-security-operations-center
+    targetRevision: HEAD
+    path: deploy/helm/agent-runtime
+    helm:
+      releaseName: soc-agent-runtime
+      valueFiles:
+        - values.yaml
+        - values-production.yaml
+      parameters:
+        - name: image.tag
+          value: "WILL_BE_REPLACED_BY_CI"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: soc-agents
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 1m
+  revisionHistoryLimit: 5
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+
+---
+# Child Application: OpenTelemetry Collector
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: soc-otel-collector
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: soc-otel-collector
+    app.kubernetes.io/part-of: ai-agent-soc
+    tier: observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: soc-platform
+  source:
+    repoURL: https://github.com/acme-corp/ai-agent-security-operations-center
+    targetRevision: HEAD
+    path: deploy/helm/otel-collector
+    helm:
+      releaseName: soc-otel-collector
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: soc-observability
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 1m
+  revisionHistoryLimit: 3

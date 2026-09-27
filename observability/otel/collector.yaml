@@ -1,102 +1,262 @@
+# OpenTelemetry Collector configuration for the AI Agent SOC platform.
+#
+# Deployment: Kubernetes DaemonSet (one collector per node) + a central
+# aggregator Deployment for cross-node metrics aggregation.
+#
+# Architecture:
+#   Application pods → otlp/grpc (4317) or otlp/http (4318)
+#     → OTel Collector (this config)
+#       → Jaeger (traces) + Prometheus (metrics) + Loki (logs)
+
+extensions:
+  health_check:
+    endpoint: "0.0.0.0:13133"
+  pprof:
+    endpoint: "0.0.0.0:1777"
+  zpages:
+    endpoint: "0.0.0.0:55679"
+
 receivers:
   otlp:
     protocols:
       grpc:
-        endpoint: 0.0.0.0:4317
+        endpoint: "0.0.0.0:4317"
+        tls:
+          insecure: false
+          cert_file: /etc/otel/tls/tls.crt
+          key_file: /etc/otel/tls/tls.key
+          client_ca_file: /etc/otel/tls/ca.crt
       http:
-        endpoint: 0.0.0.0:4318
+        endpoint: "0.0.0.0:4318"
+        cors:
+          allowed_origins:
+            - "https://soc.internal"
+          allowed_headers:
+            - "Content-Type"
+            - "X-Tenant-ID"
+        tls:
+          insecure: false
+          cert_file: /etc/otel/tls/tls.crt
+          key_file: /etc/otel/tls/tls.key
 
+  # Prometheus scrape for self-monitoring metrics
   prometheus:
     config:
       scrape_configs:
-        - job_name: soc-api
-          scrape_interval: 15s
+        - job_name: "otelcol"
+          scrape_interval: 30s
           static_configs:
-            - targets: ["soc-api:8000"]
-        - job_name: soc-agent-runtime
-          scrape_interval: 15s
-          static_configs:
-            - targets: ["soc-agent-runtime:9090"]
+            - targets: ["0.0.0.0:8888"]
+
+  # Host metrics for node-level observability
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      disk:
+      filesystem:
+        exclude_mount_points:
+          mount_points: ["/dev", "/proc", "/sys", "/run/k8s-containerd"]
+          match_type: strict
+      load:
+      memory:
+      network:
+      paging:
+      processes:
+
+  # Kubernetes cluster receiver for pod/node metrics
+  k8s_cluster:
+    auth_type: serviceAccount
+    collection_interval: 30s
+    node_conditions_to_report: [Ready, MemoryPressure, DiskPressure]
+    allocatable_types_to_report: [cpu, memory]
 
 processors:
-  batch:
-    timeout: 10s
-    send_batch_size: 1024
-
+  # Memory limiter MUST come first to prevent OOM crashes
   memory_limiter:
-    check_interval: 1s
-    limit_mib: 512
-    spike_limit_mib: 128
+    check_interval: 5s
+    limit_percentage: 75
+    spike_limit_percentage: 20
 
-  resource:
-    attributes:
-      - key: service.namespace
-        value: ai-agent-soc
-        action: insert
-      - key: deployment.environment
-        from_attribute: ENVIRONMENT
-        action: insert
+  # Batch processor for efficient export
+  batch:
+    send_batch_size: 1000
+    send_batch_max_size: 2000
+    timeout: 5s
 
-  # PII scrubbing - see pii-scrub-processor.yaml for patterns
-  transform/pii_scrub:
+  # Resource detection: add cloud/k8s metadata to all telemetry
+  resourcedetection:
+    detectors: [env, eks, ecs, ec2]
+    timeout: 10s
+    override: false
+    eks:
+      resource_attributes:
+        k8s.cluster.name:
+          enabled: true
+
+  # Kubernetes attribute enrichment
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    filter:
+      node_from_env_var: KUBE_NODE_NAME
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.deployment.name
+        - k8s.namespace.name
+        - k8s.node.name
+        - k8s.container.name
+      annotations:
+        - tag_name: soc.tenant-id
+          key: soc.io/tenant-id
+          from: pod
+      labels:
+        - tag_name: app.name
+          key: app
+          from: pod
+        - tag_name: app.version
+          key: version
+          from: pod
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.ip
+      - sources:
+          - from: connection
+
+  # PII scrubbing — see pii-scrub-processor.yaml for full transform ruleset
+  transform/scrub_pii:
+    error_mode: ignore
     trace_statements:
       - context: span
         statements:
-          - replace_pattern(attributes["principal_id"], "^usr_[a-z0-9]{8}.*", "usr_REDACTED")
-          - replace_pattern(attributes["payload.email"], ".*@.*", "[REDACTED_EMAIL]")
+          # Scrub email addresses from span attributes
+          - replace_pattern(attributes["user.email"], "^(.{2}).*(@.*)$", "$$1***$$2")
+          - replace_all_patterns(attributes, "value", "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}", "[EMAIL_REDACTED]")
+          # Scrub AWS account IDs from span attributes
+          - replace_all_patterns(attributes, "value", "\\b\\d{12}\\b", "[AWS_ACCT_REDACTED]")
     log_statements:
       - context: log
         statements:
-          - replace_pattern(body, "(?i)bearer [a-zA-Z0-9._-]+", "Bearer [REDACTED]")
-          - replace_pattern(body, "(?i)api.key[\":=\\s]+[a-zA-Z0-9._-]+", "api_key: [REDACTED]")
+          - replace_all_patterns(attributes, "value", "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}", "[EMAIL_REDACTED]")
+          - replace_all_patterns(attributes, "value", "\\b(?:\\d{3}-?\\d{2}-?\\d{4})\\b", "[SSN_REDACTED]")
+          - replace_all_patterns(attributes, "value", "\\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\\b", "[CC_REDACTED]")
 
-  filter/exclude_health:
+  # Add SOC-specific attributes
+  attributes/soc_metadata:
+    actions:
+      - key: soc.platform.version
+        value: "1.0.0"
+        action: insert
+      - key: soc.environment
+        from_attribute: deployment.environment
+        action: upsert
+
+  # Filter out noisy health check traces
+  filter/drop_health_checks:
+    error_mode: ignore
     traces:
       span:
-        - 'attributes["http.route"] == "/health"'
-        - 'attributes["http.route"] == "/readyz"'
+        - 'attributes["http.route"] == "/api/v1/health"'
+        - 'attributes["http.route"] == "/api/v1/readiness"'
 
 exporters:
-  otlp/tempo:
-    endpoint: tempo:4317
+  # Jaeger for distributed tracing
+  otlp/jaeger:
+    endpoint: "jaeger-collector.observability.svc.cluster.local:4317"
+    tls:
+      insecure: true  # mTLS handled by service mesh within cluster
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+
+  # Prometheus for metrics (remote write to Mimir/Cortex)
+  prometheusremotewrite:
+    endpoint: "http://prometheus-remote-write.observability.svc.cluster.local:9090/api/v1/write"
     tls:
       insecure: true
+    resource_to_telemetry_conversion:
+      enabled: true
+    retry_on_failure:
+      enabled: true
 
-  prometheusremotewrite:
-    endpoint: "http://prometheus:9090/api/v1/write"
+  # Loki for log aggregation
+  loki:
+    endpoint: "http://loki.observability.svc.cluster.local:3100/loki/api/v1/push"
+    tls:
+      insecure: true
+    default_labels_enabled:
+      exporter: false
+      job: true
+      instance: true
+      level: true
 
-  opensearch:
-    http:
-      endpoint: "${OPENSEARCH_URL}"
-      tls:
-        insecure_skip_verify: false
-    dataset: otel-soc
-    namespace: prod
-
+  # Debug logging exporter (disabled in production; enable for troubleshooting)
   logging:
-    verbosity: normal
-    sampling_initial: 2
-    sampling_thereafter: 500
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+  # AWS CloudWatch for cloud-native metrics (secondary export)
+  awscloudwatchlogs:
+    log_group_name: "/aws/soc/otel"
+    log_stream_name: "${K8S_NODE_NAME}"
+    region: "us-east-1"
+    log_retention: 30
 
 service:
+  extensions: [health_check, pprof, zpages]
+
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, filter/exclude_health, transform/pii_scrub, batch, resource]
-      exporters: [otlp/tempo]
+      processors:
+        - memory_limiter
+        - resourcedetection
+        - k8sattributes
+        - transform/scrub_pii
+        - attributes/soc_metadata
+        - filter/drop_health_checks
+        - batch
+      exporters: [otlp/jaeger, logging]
 
     metrics:
-      receivers: [otlp, prometheus]
-      processors: [memory_limiter, batch, resource]
-      exporters: [prometheusremotewrite]
+      receivers: [otlp, prometheus, hostmetrics, k8s_cluster]
+      processors:
+        - memory_limiter
+        - resourcedetection
+        - k8sattributes
+        - attributes/soc_metadata
+        - batch
+      exporters: [prometheusremotewrite, logging]
 
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, transform/pii_scrub, batch, resource]
-      exporters: [opensearch, logging]
+      processors:
+        - memory_limiter
+        - resourcedetection
+        - k8sattributes
+        - transform/scrub_pii
+        - attributes/soc_metadata
+        - batch
+      exporters: [loki, awscloudwatchlogs, logging]
 
   telemetry:
     logs:
-      level: warn
+      level: "info"
+      initial_fields:
+        service: "otelcol"
     metrics:
-      address: 0.0.0.0:8888
+      level: detailed
+      address: "0.0.0.0:8888"

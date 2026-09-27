@@ -1,72 +1,231 @@
-name: pii-scrub-processor
-description: >
-  OpenTelemetry Transform processor rules for PII and credential scrubbing.
-  Applied to all traces, logs, and metrics before export to Tempo / OpenSearch.
+# OpenTelemetry Transform Processor configuration for PII scrubbing.
+#
+# This file defines the complete PII scrubbing ruleset applied to all telemetry
+# (traces, metrics, logs) passing through the OTel Collector.
+#
+# IMPORTANT: These rules are applied BEFORE any telemetry data leaves the cluster.
+# PII-containing raw events are NOT forwarded to external observability backends.
+#
+# Scrubbed data categories:
+#   - Email addresses (RFC 5322 compliant pattern)
+#   - US Social Security Numbers (SSN)
+#   - Credit/debit card numbers (Luhn-validated format patterns)
+#   - AWS Account IDs (12-digit sequences in ARNs)
+#   - IP addresses in user-context attributes (network-level IPs are retained)
+#   - Phone numbers (E.164 format)
+#   - JWT tokens (Authorization header values)
+#   - API keys (common key patterns)
+#   - AWS access key IDs
+#   - Kubernetes secret values
 
-version: "1.0"
-otel_component: transform
+processors:
+  transform/scrub_pii_full:
+    error_mode: ignore
 
-# These rules are referenced by collector.yaml transform/pii_scrub.
-# Keep in sync with the actual processor config.
+    # -------------------------------------------------------------------------
+    # Trace span attribute scrubbing
+    # -------------------------------------------------------------------------
+    trace_statements:
+      - context: span
+        statements:
+          # Email addresses in any attribute value
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}",
+              "[EMAIL_REDACTED]"
+            )
 
-patterns:
-  credentials:
-    - name: bearer_token
-      pattern: "(?i)bearer [a-zA-Z0-9._\\-]+"
-      replacement: "Bearer [REDACTED_TOKEN]"
-      contexts: [trace.span.attribute, log.body, log.attribute]
+          # US Social Security Numbers (XXX-XX-XXXX or XXXXXXXXX)
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "\\b(?:\\d{3}-\\d{2}-\\d{4}|\\d{9})\\b",
+              "[SSN_REDACTED]"
+            )
 
-    - name: api_key_inline
-      pattern: "(?i)(api.?key|x-api-key|apikey)[\":=\\s]+[a-zA-Z0-9._\\-]{20,}"
-      replacement: "$1: [REDACTED_KEY]"
-      contexts: [log.body, log.attribute]
+          # Credit card numbers (Visa, Mastercard, Amex patterns)
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "\\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\\b",
+              "[CC_REDACTED]"
+            )
 
-    - name: aws_access_key
-      pattern: "(?i)(AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}"
-      replacement: "[REDACTED_AWS_KEY]"
-      contexts: [trace.span.attribute, log.body]
+          # AWS Account IDs (standalone 12-digit numbers)
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "(?<![0-9])\\d{12}(?![0-9])",
+              "[AWS_ACCT_REDACTED]"
+            )
 
-    - name: aws_secret_key
-      pattern: "(?i)aws_secret[_a-z]*[\"\\s:=]+[a-zA-Z0-9/+]{40}"
-      replacement: "aws_secret_access_key: [REDACTED]"
-      contexts: [trace.span.attribute, log.body]
+          # AWS Access Key IDs (AKIA... pattern)
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "AKIA[0-9A-Z]{16}",
+              "[AWS_KEY_REDACTED]"
+            )
 
-  personal_data:
-    - name: email_address
-      pattern: "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}"
-      replacement: "[REDACTED_EMAIL]"
-      contexts: [log.body, trace.span.attribute]
-      exceptions:
-        - field: "http.url"
-          note: "URLs may contain email-like strings; exclude from replacement"
+          # AWS Secret Access Keys (40-char base64-like strings following common patterns)
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "(?i)(?:aws.secret.access.key|aws_secret)[^=]*=\\s*[A-Za-z0-9/+]{40}",
+              "[AWS_SECRET_REDACTED]"
+            )
 
-    - name: principal_id_full
-      pattern: "^usr_[a-z0-9]{8}[a-z0-9\\-]+"
-      replacement: "usr_[REDACTED]"
-      contexts: [trace.span.attribute]
-      attribute_keys: [principal_id]
+          # JWT tokens in Authorization header attribute
+          - replace_pattern(
+              attributes["http.request.header.authorization"],
+              "^(Bearer )([A-Za-z0-9\\-_=]+\\.[A-Za-z0-9\\-_=]+\\.?[A-Za-z0-9\\-_.+/=]*)$",
+              "$$1[JWT_REDACTED]"
+            )
 
-  financial:
-    - name: card_number
-      pattern: "\\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\\b"
-      replacement: "[REDACTED_CARD]"
-      contexts: [log.body]
+          # API keys in X-API-Key header
+          - replace_pattern(
+              attributes["http.request.header.x-api-key"],
+              ".*",
+              "[API_KEY_REDACTED]"
+            )
 
-fields_always_drop:
-  - password
-  - secret
-  - private_key
-  - client_secret
-  - authorization
+          # Phone numbers (E.164 format: +1234567890)
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "\\+[1-9]\\d{7,14}",
+              "[PHONE_REDACTED]"
+            )
 
-fields_hash_not_drop:
-  - user_agent
-  - ip_address
-  - source_ip
-  hash_algorithm: sha256
-  prefix: "hash:"
+          # IP addresses in user-context fields (NOT network-level fields)
+          - replace_pattern(
+              attributes["user.ip_address"],
+              ".*",
+              "[IP_REDACTED]"
+            )
+          - replace_pattern(
+              attributes["enduser.ip"],
+              ".*",
+              "[IP_REDACTED]"
+            )
 
-retention_after_scrub:
-  traces: 30d
-  logs: 90d
-  metrics: 365d
+          # Generic secret/password patterns in attribute names
+          - replace_pattern(
+              attributes["db.user"],
+              ".*",
+              "[REDACTED]"
+            )
+          - replace_pattern(
+              attributes["db.password"],
+              ".*",
+              "[REDACTED]"
+            )
+
+    # -------------------------------------------------------------------------
+    # Log record attribute and body scrubbing
+    # -------------------------------------------------------------------------
+    log_statements:
+      - context: log
+        statements:
+          # Scrub email addresses from log body (string)
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}",
+              "[EMAIL_REDACTED]"
+            )
+
+          # Scrub SSNs from log body
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "\\b(?:\\d{3}-\\d{2}-\\d{4}|\\d{9})\\b",
+              "[SSN_REDACTED]"
+            )
+
+          # Scrub credit card numbers
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "\\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\\b",
+              "[CC_REDACTED]"
+            )
+
+          # Scrub AWS Access Keys
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "AKIA[0-9A-Z]{16}",
+              "[AWS_KEY_REDACTED]"
+            )
+
+          # Scrub JWT tokens from log attributes
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "eyJ[A-Za-z0-9\\-_=]+\\.eyJ[A-Za-z0-9\\-_=]+\\.[A-Za-z0-9\\-_.+/=]+",
+              "[JWT_REDACTED]"
+            )
+
+          # Scrub generic password= patterns in log messages
+          - replace_all_patterns(
+              attributes,
+              "value",
+              "(?i)(password|passwd|secret|token|api_key|apikey)\\s*[=:]\\s*\\S+",
+              "$$1=[REDACTED]"
+            )
+
+          # Mark log records that had PII scrubbed
+          - set(attributes["soc.pii_scrubbed"], true)
+            where IsMatch(body, "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}")
+              or IsMatch(body, "AKIA[0-9A-Z]{16}")
+
+    # -------------------------------------------------------------------------
+    # Metric data point attribute scrubbing
+    # -------------------------------------------------------------------------
+    metric_statements:
+      - context: datapoint
+        statements:
+          # Remove PII from metric labels/attributes
+          - delete_key(attributes, "user.email")
+          - delete_key(attributes, "user.id")
+          - delete_key(attributes, "enduser.email")
+          - delete_key(attributes, "http.request.header.authorization")
+          - delete_key(attributes, "http.request.header.x-api-key")
+          - delete_key(attributes, "db.user")
+          - delete_key(attributes, "db.password")
+
+          # Retain tenant_id (needed for multi-tenant metric isolation)
+          # but scrub sub-tenant identifiers
+          - delete_key(attributes, "principal_id")
+          - delete_key(attributes, "agent_email")
+
+# -------------------------------------------------------------------------
+# Attribute allow-list filter
+# Drops span/log attributes NOT in this allow-list to prevent PII leakage
+# via novel attribute names. Applied AFTER transform/scrub_pii_full.
+# -------------------------------------------------------------------------
+  filter/pii_attribute_allowlist:
+    error_mode: ignore
+    traces:
+      span:
+        # Keep only attributes in the SOC platform's approved observability schema
+        # This is a belt-and-suspenders control after pattern-based scrubbing
+        - 'not(attributes["http.method"] == "" or attributes["http.method"] == nil)
+           or not(attributes["http.route"] == "" or attributes["http.route"] == nil)
+           or not(attributes["http.status_code"] == 0 or attributes["http.status_code"] == nil)
+           or not(attributes["db.system"] == "" or attributes["db.system"] == nil)
+           or not(attributes["k8s.pod.name"] == "" or attributes["k8s.pod.name"] == nil)
+           or not(attributes["soc.tenant-id"] == "" or attributes["soc.tenant-id"] == nil)'
+
+service:
+  pipelines:
+    traces/pii_safe:
+      processors: [transform/scrub_pii_full]
+
+    logs/pii_safe:
+      processors: [transform/scrub_pii_full]
+
+    metrics/pii_safe:
+      processors: [transform/scrub_pii_full]

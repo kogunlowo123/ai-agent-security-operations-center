@@ -1,273 +1,283 @@
-# Posture Degradation Response Runbook
+# Posture Score Degradation Runbook
 
-**Version:** 1.1  
-**Owner:** Security Operations Centre  
-**Last Updated:** 2024-12-01  
-**Review Cadence:** Quarterly  
+**Version:** 1.0  
+**Owner:** SOC Platform Team  
+**Last Updated:** 2024-01-25  
+**Applies To:** Security posture score degradation events (any tenant)
 
 ---
 
 ## Overview
 
-This runbook defines the response procedure when the platform's security posture score degrades below defined thresholds. Posture score degradation may indicate an active attack, configuration drift, an accumulation of unresolved findings, or a change in the threat environment.
+The SOC platform computes a security posture score (`GET /api/v1/posture/score`) ranging from 0–100 across six weighted components: Identity (25%), Policy (20%), Runtime (20%), Supply Chain (15%), SDLC (10%), and Mesh (10%).
 
-**Posture Score Scale:**
+A posture degradation event is triggered when:
+- The overall score drops by **≥ 5 points** in a 24-hour rolling window, OR
+- Any single component score drops by **≥ 10 points**, OR
+- The overall score falls below the rating threshold boundaries:
+  - EXCELLENT → GOOD (≥ 90 → < 90)
+  - GOOD → FAIR (≥ 75 → < 75)
+  - FAIR → POOR (≥ 60 → < 60)
+  - POOR → CRITICAL (≥ 40 → < 40)
 
-| Score Range | Rating | Alert Action |
-|---|---|---|
-| 90–100 | EXCELLENT | No action required |
-| 75–89 | GOOD | Weekly review |
-| 60–74 | FAIR | Daily review; investigate root cause within 48 h |
-| 40–59 | POOR | Immediate investigation; escalate to security lead |
-| 0–39 | CRITICAL | Emergency response; escalate to CISO |
-
-**Posture Alerts are triggered when:**
-- Score drops below a configured threshold (default: GOOD → FAIR transition, i.e., score < 75)
-- Score drops by ≥10 points in any 1-hour window (rapid degradation indicator)
-- Any component score (identity, network, data, workload, endpoint) drops to 0
+Degradation events are delivered as PagerDuty LOW/MEDIUM priority alerts (CRITICAL incidents use the standard incident response runbook).
 
 ---
 
-## Phase 1: Alert Acknowledgement
+## Step 1: Acknowledge and Characterise the Degradation
 
-### 1.1 Receiving the Alert
-
-Posture degradation alerts arrive via:
-
-- **PagerDuty**: `Posture-Degradation` policy (CRITICAL rating pages immediately; POOR pages within 15 min; FAIR creates a ticket)
-- **Slack**: `#soc-posture-alerts` channel
-- **Email**: `soc-alerts@acme-corp.com` distribution list
-
-### 1.2 Initial Assessment
+### 1.1 Get Current Posture Score
 
 ```bash
-# Get current posture score
-GET /api/v1/posture/score?tenant_id=<TENANT>
-
-# Response includes score, rating, trend, components, and recommendations
-{
-  "score": 48.5,
-  "rating": "POOR",
-  "trend": "DEGRADING",
-  "components": {
-    "identity": 20.0,
-    "network": 85.0,
-    "data": 60.0,
-    "workload": 75.0,
-    "endpoint": 40.0
-  },
-  "recommendations": [
-    "Review and remediate CRITICAL findings immediately.",
-    "Engage incident response team for high-severity events."
-  ]
-}
+curl -H "Authorization: Bearer $TOKEN" \
+  -H "X-Tenant-ID: $TENANT" \
+  https://soc.internal/api/v1/posture/score | jq .
 ```
 
-Identify the **degrading component(s)**:
+Note:
+- `overall_score`: Current score (0–100)
+- `rating`: `EXCELLENT`, `GOOD`, `FAIR`, `POOR`, or `CRITICAL`
+- `trend`: `IMPROVING`, `STABLE`, or `DEGRADING`
+- `component_scores`: Per-component breakdown
+- `recommendations`: Auto-generated remediation steps
 
-- **Identity score low** → focus on identity.access.violation events, privilege escalation, credential theft
-- **Network score low** → focus on network.anomaly, data exfiltration, C2 beacon events
-- **Data score low** → focus on data.access.anomaly, misconfiguration, S3/blob storage events
-- **Workload score low** → focus on container escape, malware, lateral movement in compute
-- **Endpoint score low** → focus on EDR alerts, persistence mechanisms, suspicious process execution
+### 1.2 Identify the Degraded Component(s)
+
+```bash
+# Get component-level detail with historical comparison
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://soc.internal/api/v1/posture/score?history=true&hours=48" | \
+  jq '.component_scores[] | select(.trend == "DEGRADING")'
+```
+
+### 1.3 Check for Correlated Incidents
+
+Posture degradation is often a lagging indicator of an active incident:
+
+```bash
+# Check for open incidents in the last 48 hours
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://soc.internal/api/v1/incidents?status=OPEN,IN_PROGRESS&hours=48" | \
+  jq '.items[] | {id, severity, title, created_at}'
+```
+
+If open incidents exist with severity HIGH or CRITICAL, **switch to the Incident Response Runbook** and handle the incident first.
 
 ---
 
-## Phase 2: Root Cause Investigation
+## Step 2: Root Cause Analysis by Component
 
-### 2.1 Review Contributing Events
+### Component: Identity (weight: 25%)
 
+Score degradation in the Identity component indicates issues in `ai-agent-identity-governance`.
+
+**Common causes and checks:**
+
+| Cause | Investigation Command |
+|-------|----------------------|
+| Increase in identity.access.violation events | `GET /api/v1/events?type=identity.access.violation&hours=24` |
+| New agents without proper IAM role assignment | Check identity-governance for agents missing role bindings |
+| Stale or over-privileged service accounts | Review IAM policy drift reports |
+| Failed MFA events | `GET /api/v1/events?type=auth.mfa.failure&hours=24` |
+
+**Remediation:**
 ```bash
-# Get events contributing to posture degradation (last 24 hours, sorted by score impact)
-GET /api/v1/posture/contributing-events?tenant_id=<TENANT>&hours=24&severity=CRITICAL,HIGH
-
-# List unresolved incidents driving the posture score down
-GET /api/v1/incidents?status=OPEN&severity=CRITICAL,HIGH&tenant_id=<TENANT>
+# Trigger identity posture re-evaluation after fixing IAM issues
+curl -X POST https://identity-governance.internal/api/v1/posture/recompute \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-### 2.2 Investigate Configuration Drift
+### Component: Policy (weight: 20%)
 
-Posture degradation may result from cloud misconfiguration rather than an active attack:
+Score degradation in the Policy component indicates issues in `ai-agent-policy-enforcement`.
 
+**Common causes:**
+- Policy violations by AI agents (accessing resources outside their authorised scope)
+- Policy definition gaps (new agent capabilities without corresponding policies)
+- Policy engine downtime causing bypass events
+
+**Investigation:**
 ```bash
-# Check for new misconfigurations
-soc-cli posture drift-check --tenant <TENANT> --baseline latest
-
-# Common causes:
-# - New S3 bucket created without block-public-access
-# - IAM policy attached with * permissions
-# - Security group rule opened port 22/3389 to 0.0.0.0/0
-# - CloudTrail logging disabled in a region
-# - MFA disabled for privileged users
+curl "https://soc.internal/api/v1/events?type=policy.violation&hours=24&severity=HIGH,CRITICAL" \
+  -H "Authorization: Bearer $TOKEN" | jq '.items | length'
 ```
 
-### 2.3 Trend Analysis
+### Component: Runtime (weight: 20%)
 
+Score degradation in the Runtime component indicates issues in `ai-agent-runtime-security`.
+
+**Common causes:**
+- Anomalous syscall patterns from agent containers
+- Container escape attempts
+- Unexpected network connections from agent pods
+
+**Investigation:**
 ```bash
-# Get posture score history (last 7 days, hourly)
-GET /api/v1/posture/history?tenant_id=<TENANT>&interval=1h&days=7
+# Check runtime anomaly events
+curl "https://soc.internal/api/v1/events?type=runtime.anomaly&hours=24" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Check Falco alerts (if integrated)
+kubectl get events -n agent-runtime --field-selector reason=FalcoAlert
 ```
 
-Identify the degradation onset time. Cross-reference with:
-- Change records (ServiceNow: `https://acme.service-now.com/change`)
-- Recent deployments (check CI/CD pipeline logs)
-- Incident timeline (was an incident opened around the same time?)
+### Component: Supply Chain (weight: 15%)
 
----
+Score degradation in Supply Chain indicates issues in `ai-agent-supply-chain-security`.
 
-## Phase 3: Response by Rating
+**Common causes:**
+- New CVEs in agent dependencies above CVSS 7.0
+- Dependency version drift (agents using versions different from approved baseline)
+- Compromised package detected in agent runtime
 
-### CRITICAL Rating (Score 0–39)
-
-**Immediately:**
-1. Page the CISO and IR Lead via PagerDuty `CRITICAL-ESCALATION` policy
-2. Declare a Security Incident — create incident with severity CRITICAL in the SOC portal
-3. Stand up a bridge call: `soc-cli bridge start --incident-id <INC-ID>`
-4. Do NOT attempt to remediate alone — require at least 2 responders
-
-**Within 30 minutes:**
-5. Identify the top 3 events by severity driving the score
-6. Determine if the degradation is caused by an active attack or configuration errors
-7. If active attack: follow the Incident Response Runbook (`docs/runbooks/incident-response.md`)
-8. If configuration error: proceed to Phase 4 (Remediation)
-
-### POOR Rating (Score 40–59)
-
-**Within 15 minutes:**
-1. Notify security lead via Slack DM (do not page)
-2. Review all CRITICAL and HIGH open incidents — are they being actively worked?
-3. Identify the top contributing events using the API above
-
-**Within 2 hours:**
-4. For each unresolved CRITICAL/HIGH incident: verify it has an active assignee and an ETA for containment
-5. Identify any quick-win remediations (see Phase 4)
-6. Document findings in a posture triage note:
-
+**Investigation:**
 ```bash
-soc-cli posture note add \
-  --tenant <TENANT> \
-  --note "Posture POOR (48.5). Root cause: 3 unresolved CRITICAL incidents (INC-001, INC-002, INC-003). Identity component at 20% due to pass-the-hash campaign. IR team engaged. ETA containment: 4 hours."
+# Check supply chain events
+curl "https://soc.internal/api/v1/events?type=supply_chain.*&hours=24" \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-### FAIR Rating (Score 60–74)
+**Remediation:**
+- Update affected packages: coordinate with DevOps for rolling deployment
+- If actively exploited CVE: consider taking the affected agent offline
 
-**Within 2 hours:**
-1. Review contributing events and open incidents
-2. Check for configuration drift using `drift-check` above
-3. Review AI-generated recommendations in the posture score response
+### Component: SDLC (weight: 10%)
 
-**Within 48 hours:**
-4. Create remediation tickets for each identified gap
-5. Verify that detection rules cover the contributing event types
+Score degradation in SDLC indicates issues in `ai-agent-sdlc-security`.
 
----
+**Common causes:**
+- SAST/DAST findings above threshold in recent deployments
+- Secrets committed to repository
+- Unsigned build artifacts in production
 
-## Phase 4: Remediation
-
-### 4.1 Quick Wins (< 30 min each)
-
-**Misconfigured S3 bucket:**
+**Investigation:**
 ```bash
-aws s3api put-public-access-block \
-  --bucket <BUCKET> \
-  --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+# Check SDLC events
+curl "https://soc.internal/api/v1/events?type=ci_cd.*&hours=24&severity=HIGH,CRITICAL" \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-**Overly permissive security group:**
+### Component: Mesh (weight: 10%)
+
+Score degradation in the Mesh component indicates issues in `ai-agent-service-mesh-security`.
+
+**Common causes:**
+- mTLS failures between services (authentication errors)
+- Unexpected service-to-service communication (policy violations in the mesh)
+- Service mesh control plane connectivity issues
+
+**Investigation:**
 ```bash
-aws ec2 revoke-security-group-ingress \
-  --group-id <SG_ID> \
-  --protocol tcp \
-  --port 22 \
-  --cidr 0.0.0.0/0
-```
+# Check mesh events
+curl "https://soc.internal/api/v1/events?type=mesh.*&hours=24" \
+  -H "Authorization: Bearer $TOKEN"
 
-**Re-enable CloudTrail in a region:**
-```bash
-aws cloudtrail start-logging --name <TRAIL_NAME> --region <REGION>
-```
-
-**Enforce MFA for privileged users:**
-```bash
-# AWS IAM Identity Centre — attach MFA enforcement policy
-soc-cli identity enforce-mfa --group "privileged-users" --provider aws-sso
-```
-
-### 4.2 Resolve Contributing Incidents
-
-For each open CRITICAL/HIGH incident contributing to the posture score:
-1. Confirm active remediation is in progress
-2. If stale (no updates > 2 hours on CRITICAL, > 8 hours on HIGH): reassign and escalate
-
-### 4.3 Update False Positive Registry
-
-If false positives are inflating the event count driving down the posture score:
-
-```bash
-soc-cli fp-registry add \
-  --event-type "network.port_scan.detected" \
-  --source-ip "10.0.0.50" \
-  --justification "Authorised internal security scanner — Change #CHG-2024-0892" \
-  --expiry "2025-01-01T00:00:00Z"
+# Check Istio/Envoy logs
+kubectl logs -n istio-system deployment/istiod --tail=100 | grep ERROR
 ```
 
 ---
 
-## Phase 5: Verification and Closure
+## Step 3: Remediation
 
-### 5.1 Verify Score Recovery
+### 3.1 Immediate Containment
 
-After applying remediations, monitor the posture score:
+If the posture score is CRITICAL (< 40) or POOR (< 60) and actively degrading:
 
-```bash
-# Poll posture score every 5 minutes during recovery
-watch -n 300 'soc-cli posture score --tenant <TENANT>'
-```
+1. **Activate enhanced monitoring**: Reduce the posture score refresh interval from 1 hour to 5 minutes:
+   ```bash
+   curl -X POST https://soc.internal/api/v1/posture/config \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -d '{"refresh_interval_seconds": 300}'
+   ```
 
-Score recovery timeline expectations:
-- After resolving a CRITICAL incident: expect +20–30 points within 1 score calculation cycle (default: 15 min)
-- After fixing configuration drift: expect +5–15 points
-- After clearing FP noise: variable, depending on FP volume
+2. **Freeze non-critical agent deployments**: Prevent new agent versions from being deployed while posture is CRITICAL:
+   ```bash
+   # Apply deployment freeze annotation to CI/CD pipeline
+   kubectl annotate namespace agent-runtime soc.deployment-freeze=true
+   ```
 
-### 5.2 Post-Degradation Report
+3. **Notify asset owners**: Alert the responsible team for each degraded component.
 
-For any POOR or CRITICAL degradation event, complete a posture recovery report within 24 hours:
+### 3.2 Root Cause Remediation
 
-```markdown
-## Posture Degradation Report — <DATE>
+Follow the component-specific remediation steps in Step 2 for each degraded component.
 
-**Tenant:** <TENANT>
-**Lowest Score:** <SCORE> (<RATING>)
-**Duration Below GOOD:** <HH:MM>
-**Root Cause:** <DESCRIPTION>
-**Contributing Events:** <LIST>
-**Actions Taken:** <LIST>
-**Score at Closure:** <SCORE>
-**Preventive Measures:** <LIST>
-```
+### 3.3 Verify Recovery
 
-### 5.3 Update Posture Thresholds (if needed)
-
-If the alert threshold is generating too many false positives (legitimate changes triggering alerts):
+After applying remediations, force a posture score refresh and verify improvement:
 
 ```bash
-# Update alert threshold for tenant
-soc-cli posture config set \
-  --tenant <TENANT> \
-  --alert-threshold 65 \
-  --rapid-degradation-threshold 15
+# Force immediate posture score recompute
+curl -X POST https://soc.internal/api/v1/posture/score/refresh \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Tenant-ID: $TENANT"
+
+# Wait 60 seconds, then check the new score
+sleep 60
+curl -H "Authorization: Bearer $TOKEN" \
+  https://soc.internal/api/v1/posture/score | jq '{overall_score, rating, trend}'
 ```
 
-Document the rationale in the tenant configuration audit log.
+The score should show `"trend": "IMPROVING"` within 2–3 refresh cycles.
 
 ---
 
-## Escalation Matrix
+## Step 4: Post-Degradation Actions
 
-| Condition | Escalate To | Method |
-|---|---|---|
-| Score CRITICAL (<40) | CISO + IR Lead | PagerDuty |
-| Score POOR (<60) for > 4 hours | Security Lead | Slack DM |
-| Score degrading during active incident | Incident Commander | Bridge call |
-| Unknown root cause after 2 hours | Senior Security Architect | Slack |
-| Data component critical + PII involved | Legal + Privacy | Email + Slack |
+### 4.1 Document the Degradation
+
+For degradation events lasting > 4 hours or crossing a rating boundary:
+
+```bash
+# Create a posture-degradation report
+cat > /tmp/posture-report-$(date +%Y%m%d).md << EOF
+# Posture Degradation Report - $(date +%Y-%m-%d)
+## Affected Tenant: $TENANT
+## Duration: $START_TIME to $END_TIME
+## Score Range: $MIN_SCORE to $CURRENT_SCORE
+## Components Affected: $COMPONENTS
+## Root Cause: ...
+## Remediation Actions: ...
+## Prevention: ...
+EOF
+```
+
+### 4.2 Update Detection Rules
+
+If the degradation was caused by a new threat pattern not previously covered by detection rules:
+
+1. Create a new detection rule in `services/api/src/rules/`
+2. Add corresponding tests to `tests/unit/test_detection_rules.py`
+3. Submit for review: `gh pr create --base main --title "feat: add detection rule for [pattern]"`
+
+### 4.3 Posture Improvement Tasks
+
+The posture score recommendations (`GET /api/v1/posture/score` → `recommendations` field) provide a prioritised backlog of improvements. Create Jira/Linear tickets for each unresolved recommendation with severity MEDIUM or higher.
+
+---
+
+## Escalation Thresholds
+
+| Condition | Escalation Target | Method |
+|-----------|------------------|--------|
+| Score < 40 (CRITICAL) | SOC Lead + CISO | PagerDuty + Slack #soc-critical |
+| Score drops > 20 points in 1h | SOC Lead | PagerDuty |
+| Score < 60 for > 24h | Engineering Lead | Slack #soc-alerts + Jira |
+| Supply chain component < 50 | CISO + Legal | Email + Slack |
+
+---
+
+## Reference: Posture Score Calculation
+
+The overall posture score is computed as:
+
+```
+overall = (identity × 0.25) + (policy × 0.20) + (runtime × 0.20) +
+          (supply_chain × 0.15) + (sdlc × 0.10) + (mesh × 0.10)
+```
+
+Each component score is calculated from event counts over a 24-hour rolling window:
+- Base score: 100
+- Deductions: −5 per HIGH event, −10 per CRITICAL event (capped at −60 per component)
+- Bonuses: +2 per 24-hour period with zero HIGH/CRITICAL events (up to +10)

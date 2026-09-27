@@ -1,0 +1,291 @@
+# Default values for soc-agent-runtime Helm chart.
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+  storageClass: ""
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image:
+  registry: ghcr.io
+  repository: acme-corp/ai-agent-security-operations-center/soc-agent-runtime
+  tag: "latest"
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# ---------------------------------------------------------------------------
+# Deployment
+# ---------------------------------------------------------------------------
+replicaCount: 2
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# ---------------------------------------------------------------------------
+# Service (internal — no ingress, consumed via SQS + API)
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9090
+  targetPort: 9090
+  protocol: TCP
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Agent configuration
+# ---------------------------------------------------------------------------
+agents:
+  # Triage agent — classifies events and maps to ATT&CK
+  triage:
+    enabled: true
+    replicas: 2
+    model: "claude-sonnet-4-6"
+    maxConcurrentJobs: 10
+    timeoutSeconds: 30
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "2000m"
+        memory: "2Gi"
+
+  # Threat hunt agent — generates and executes hunt hypotheses
+  threatHunt:
+    enabled: true
+    replicas: 1
+    model: "claude-opus-4-5"
+    maxConcurrentJobs: 5
+    timeoutSeconds: 120
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2000m"
+        memory: "4Gi"
+
+  # Posture agent — computes posture scores and generates recommendations
+  posture:
+    enabled: true
+    replicas: 1
+    model: "claude-haiku-4-5"
+    scheduleIntervalMinutes: 15
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "256Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+# ---------------------------------------------------------------------------
+# RAG / Retrieval configuration
+# ---------------------------------------------------------------------------
+rag:
+  opensearch:
+    indexName: "mitre-attck-v15"
+    knnAlgorithm: "hnsw"
+    knnEf: 512
+    knnM: 48
+    topK: 20
+    rerankerTopK: 5
+  embeddingModel: "text-embedding-3-large"
+  chunkSize: 400
+  chunkOverlap: 50
+
+# ---------------------------------------------------------------------------
+# SQS configuration
+# ---------------------------------------------------------------------------
+sqs:
+  triageQueueUrl: ""      # Overridden by ExternalSecret
+  huntQueueUrl: ""        # Overridden by ExternalSecret
+  visibilityTimeoutSeconds: 300
+  maxMessages: 10
+  waitTimeSeconds: 20
+
+# ---------------------------------------------------------------------------
+# Resources (default — overridden per agent above)
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "1000m"
+    memory: "1Gi"
+
+# ---------------------------------------------------------------------------
+# Autoscaling (for triage workers)
+# ---------------------------------------------------------------------------
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 20
+  # Scale based on SQS queue depth (custom metric via KEDA)
+  keda:
+    enabled: true
+    scaledObjectSpec:
+      triggers:
+        - type: aws-sqs-queue
+          metadata:
+            queueURL: ""  # Set via ExternalSecret
+            queueLength: "5"
+            awsRegion: "us-east-1"
+            identityOwner: pod
+
+# ---------------------------------------------------------------------------
+# Pod Disruption Budget
+# ---------------------------------------------------------------------------
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ---------------------------------------------------------------------------
+# Service Account
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: false
+  name: "soc-agent-runtime"
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/soc-agent-runtime-irsa-role"
+
+# ---------------------------------------------------------------------------
+# Environment variables
+# ---------------------------------------------------------------------------
+env:
+  - name: APP_ENV
+    value: "production"
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: OTEL_SERVICE_NAME
+    value: "soc-agent-runtime"
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: "http://soc-otel-collector.soc-observability.svc.cluster.local:4317"
+  - name: ANTHROPIC_MAX_RETRIES
+    value: "3"
+  - name: ANTHROPIC_TIMEOUT_SECS
+    value: "60"
+  - name: ANTHROPIC_DEFAULT_MODEL
+    value: "claude-sonnet-4-6"
+
+envFrom:
+  - secretRef:
+      name: soc-agent-secrets
+
+# ---------------------------------------------------------------------------
+# Probes
+# ---------------------------------------------------------------------------
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 9090
+  initialDelaySeconds: 30
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 9090
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Security Context
+# ---------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# ---------------------------------------------------------------------------
+# Pod annotations & labels
+# ---------------------------------------------------------------------------
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: "/metrics"
+
+podLabels:
+  app.kubernetes.io/component: agent-runtime
+  app.kubernetes.io/part-of: ai-agent-soc
+
+# ---------------------------------------------------------------------------
+# Node selector, tolerations, affinity
+# ---------------------------------------------------------------------------
+nodeSelector:
+  # Prefer compute-optimised nodes for LLM inference
+  node.kubernetes.io/instance-type: "c6i.xlarge"
+
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - soc-agent-runtime
+          topologyKey: kubernetes.io/hostname
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  - name: tmp
+    emptyDir: {}
+  - name: agent-cache
+    emptyDir:
+      sizeLimit: "2Gi"
+
+volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+  - name: agent-cache
+    mountPath: /var/cache/soc-agents
+
+# ---------------------------------------------------------------------------
+# Network Policy
+# ---------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  egress:
+    - to: []
+      ports:
+        - port: 443   # Anthropic API + AWS APIs
+        - port: 9200  # OpenSearch
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: soc-observability
+      ports:
+        - port: 4317  # OTLP
+
+common:
+  enabled: false

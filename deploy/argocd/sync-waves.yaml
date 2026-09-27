@@ -1,0 +1,245 @@
+---
+# ArgoCD Sync Wave Configuration
+#
+# Sync waves control the order in which resources are deployed.
+# Lower wave numbers deploy first. Resources in the same wave
+# deploy concurrently. ArgoCD waits for all resources in wave N
+# to be healthy before proceeding to wave N+1.
+#
+# SOC Platform deployment order:
+#   Wave -5:  Namespaces and RBAC (foundation)
+#   Wave -3:  Secrets and ConfigMaps
+#   Wave -1:  Persistent storage (PVCs, external secrets sync)
+#   Wave  0:  Infrastructure dependencies (cert-manager, external-secrets)
+#   Wave  1:  Observability stack (OTel Collector, Prometheus)
+#   Wave  2:  Core API service
+#   Wave  3:  Agent runtime
+#   Wave  5:  Ingress and service mesh configuration
+#   Wave 10:  Smoke test jobs
+
+# ---------------------------------------------------------------------------
+# Wave -5: Namespaces
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: soc-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+  labels:
+    app.kubernetes.io/part-of: ai-agent-soc
+    istio-injection: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: soc-agents
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+  labels:
+    app.kubernetes.io/part-of: ai-agent-soc
+    istio-injection: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: soc-observability
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+  labels:
+    app.kubernetes.io/part-of: ai-agent-soc
+
+---
+# ---------------------------------------------------------------------------
+# Wave -5: RBAC — Service Accounts
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: soc-api
+  namespace: soc-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/soc-api-irsa-role"
+  labels:
+    app.kubernetes.io/name: soc-api
+    app.kubernetes.io/part-of: ai-agent-soc
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: soc-agent-runtime
+  namespace: soc-agents
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/soc-agent-runtime-irsa-role"
+  labels:
+    app.kubernetes.io/name: soc-agent-runtime
+    app.kubernetes.io/part-of: ai-agent-soc
+
+---
+# ---------------------------------------------------------------------------
+# Wave -5: RBAC — Cluster Roles
+# ---------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: soc-api-role
+  namespace: soc-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: soc-api-rolebinding
+  namespace: soc-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+subjects:
+  - kind: ServiceAccount
+    name: soc-api
+    namespace: soc-platform
+roleRef:
+  kind: Role
+  name: soc-api-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ---------------------------------------------------------------------------
+# Wave -3: External Secrets (sync from AWS Secrets Manager)
+# ---------------------------------------------------------------------------
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: soc-api-secrets
+  namespace: soc-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: ClusterSecretStore
+  target:
+    name: soc-api-secrets
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        DATABASE_URL: "{{ .db_url }}"
+        OPENSEARCH_URL: "{{ .opensearch_url }}"
+        ANTHROPIC_API_KEY: "{{ .anthropic_api_key }}"
+        SQS_QUEUE_URL: "{{ .sqs_queue_url }}"
+        JWT_SECRET: "{{ .jwt_secret }}"
+  data:
+    - secretKey: db_url
+      remoteRef:
+        key: soc/production/api
+        property: DATABASE_URL
+    - secretKey: opensearch_url
+      remoteRef:
+        key: soc/production/api
+        property: OPENSEARCH_URL
+    - secretKey: anthropic_api_key
+      remoteRef:
+        key: soc/production/api
+        property: ANTHROPIC_API_KEY
+    - secretKey: sqs_queue_url
+      remoteRef:
+        key: soc/production/api
+        property: SQS_QUEUE_URL
+    - secretKey: jwt_secret
+      remoteRef:
+        key: soc/production/api
+        property: JWT_SECRET
+
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: soc-agent-secrets
+  namespace: soc-agents
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: ClusterSecretStore
+  target:
+    name: soc-agent-secrets
+    creationPolicy: Owner
+  data:
+    - secretKey: ANTHROPIC_API_KEY
+      remoteRef:
+        key: soc/production/agents
+        property: ANTHROPIC_API_KEY
+    - secretKey: OPENSEARCH_URL
+      remoteRef:
+        key: soc/production/agents
+        property: OPENSEARCH_URL
+
+---
+# ---------------------------------------------------------------------------
+# Wave 10: Smoke Test Job (runs after all services are healthy)
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: soc-smoke-test
+  namespace: soc-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+  labels:
+    app.kubernetes.io/name: soc-smoke-test
+    app.kubernetes.io/part-of: ai-agent-soc
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: soc-smoke-test
+    spec:
+      restartPolicy: Never
+      serviceAccountName: soc-api
+      containers:
+        - name: smoke-test
+          image: curlimages/curl:8.5.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Running SOC platform smoke tests..."
+
+              # Health check
+              curl -fsS http://soc-api.soc-platform.svc.cluster.local:8080/health
+              echo "Health check passed"
+
+              # Readiness check
+              curl -fsS http://soc-api.soc-platform.svc.cluster.local:8080/ready
+              echo "Readiness check passed"
+
+              # API version check
+              VERSION=$(curl -fsS http://soc-api.soc-platform.svc.cluster.local:8080/api/v1/version | grep -o '"version":"[^"]*"')
+              echo "API version: $VERSION"
+
+              echo "All smoke tests passed."
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
