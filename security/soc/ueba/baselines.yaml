@@ -1,0 +1,142 @@
+version: "1.0"
+description: >
+  UEBA (User and Entity Behavior Analytics) baselines for AI agent principals.
+  These thresholds define normal behavior envelopes; deviations trigger anomaly
+  scoring that feeds the SOC triage pipeline.
+
+entity_types:
+
+  ai_agent:
+    description: Autonomous AI agent principals (tier T1 and above)
+    baselines:
+      api_call_rate:
+        metric: calls_per_minute
+        normal_range: [0, 50]
+        warn_threshold: 100
+        alert_threshold: 200
+        window_minutes: 5
+        aggregation: p95
+
+      model_invocation_rate:
+        metric: bedrock_invocations_per_hour
+        normal_range: [0, 120]
+        warn_threshold: 300
+        alert_threshold: 600
+        window_minutes: 60
+        aggregation: sum
+
+      unique_resource_access:
+        metric: distinct_arn_count_per_hour
+        normal_range: [0, 25]
+        warn_threshold: 50
+        alert_threshold: 100
+        window_minutes: 60
+        aggregation: count_distinct
+
+      cross_account_assumptions:
+        metric: sts_assume_role_count_per_day
+        normal_range: [0, 5]
+        warn_threshold: 10
+        alert_threshold: 20
+        window_minutes: 1440
+        aggregation: sum
+
+      data_exfiltration_bytes:
+        metric: egress_bytes_per_hour
+        normal_range: [0, 104857600]  # 100 MB
+        warn_threshold: 524288000     # 500 MB
+        alert_threshold: 1073741824   # 1 GB
+        window_minutes: 60
+        aggregation: sum
+
+      failed_auth_attempts:
+        metric: auth_failures_per_hour
+        normal_range: [0, 3]
+        warn_threshold: 5
+        alert_threshold: 10
+        window_minutes: 60
+        aggregation: sum
+
+      guardrail_trigger_rate:
+        metric: guardrail_blocks_per_day
+        normal_range: [0, 2]
+        warn_threshold: 5
+        alert_threshold: 10
+        window_minutes: 1440
+        aggregation: sum
+
+  human_analyst:
+    description: SOC analyst and operator principals
+    baselines:
+      query_rate:
+        metric: opensearch_queries_per_hour
+        normal_range: [0, 200]
+        warn_threshold: 500
+        alert_threshold: 1000
+        window_minutes: 60
+        aggregation: sum
+
+      off_hours_activity:
+        metric: actions_outside_business_hours
+        normal_range: [0, 5]
+        warn_threshold: 20
+        alert_threshold: 50
+        window_minutes: 480
+        aggregation: sum
+        schedule:
+          business_hours_start: "08:00"
+          business_hours_end: "20:00"
+          timezone: "UTC"
+
+      bulk_data_download:
+        metric: bulk_export_events_per_day
+        normal_range: [0, 2]
+        warn_threshold: 5
+        alert_threshold: 10
+        window_minutes: 1440
+        aggregation: sum
+
+      privilege_escalation_attempts:
+        metric: sudo_or_admin_assume_per_day
+        normal_range: [0, 1]
+        warn_threshold: 3
+        alert_threshold: 5
+        window_minutes: 1440
+        aggregation: sum
+
+anomaly_scoring:
+  algorithm: isolation_forest
+  contamination: 0.05
+  retrain_frequency_hours: 24
+  min_samples_for_training: 1000
+  features:
+    - api_call_rate
+    - model_invocation_rate
+    - unique_resource_access
+    - cross_account_assumptions
+    - data_exfiltration_bytes
+    - failed_auth_attempts
+
+scoring_thresholds:
+  low: 0.3
+  medium: 0.5
+  high: 0.7
+  critical: 0.9
+
+alert_routing:
+  low:
+    action: log_only
+    siem_severity: INFO
+  medium:
+    action: create_alert
+    siem_severity: MEDIUM
+    queue: triage-medium-queue
+  high:
+    action: create_incident
+    siem_severity: HIGH
+    queue: triage-high-queue
+  critical:
+    action: page_oncall
+    siem_severity: CRITICAL
+    queue: triage-critical-queue
+    pagerduty: true

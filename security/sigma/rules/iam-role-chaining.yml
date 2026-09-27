@@ -1,0 +1,53 @@
+title: Suspicious IAM Role Chaining by AI Agent
+id: b7d3f1a9-2e5c-4b8d-a1f2-9e4c7b3d6a8e
+status: stable
+description: |
+  Detects unusual IAM role assumption chains by AI agent principals,
+  which may indicate privilege escalation or lateral movement attempts.
+  Maps to MITRE ATT&CK T1078 (Valid Accounts) and T1548 (Abuse Elevation).
+references:
+  - https://attack.mitre.org/techniques/T1078/
+  - https://attack.mitre.org/techniques/T1548/
+  - https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-api.html
+author: AI SOC Platform
+date: 2024/01/15
+modified: 2024/11/15
+tags:
+  - attack.privilege_escalation
+  - attack.t1078
+  - attack.t1548
+  - attack.lateral_movement
+logsource:
+  product: ai-agent-soc
+  service: identity-governance
+  definition: CloudEvents from the ai-agent-identity-governance upstream repository
+detection:
+  selection:
+    event_type: "identity.access.violation"
+  role_chain_present:
+    payload.role_chain|exists: true
+  cross_account_role:
+    payload.target_account_id|not: "%source_account_id%"
+  high_privilege_role:
+    payload.target_role_name|contains:
+      - "Admin"
+      - "PowerUser"
+      - "OrganizationAccountAccessRole"
+      - "BreakGlass"
+  rapid_succession:
+    count(event_id)|timeframe|10m|gt: 5
+  condition: selection and role_chain_present and (cross_account_role or high_privilege_role or rapid_succession)
+falsepositives:
+  - Automated deployment pipelines with multi-account access requirements
+  - Scheduled cross-account backup jobs
+  - SOC analyst performing authorized investigations
+level: high
+fields:
+  - principal_id
+  - payload.source_role
+  - payload.target_role_name
+  - payload.target_account_id
+  - payload.role_chain
+  - payload.session_duration
+  - source_repo
+  - tenant_id

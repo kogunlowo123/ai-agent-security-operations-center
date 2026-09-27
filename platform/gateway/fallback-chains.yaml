@@ -1,0 +1,80 @@
+# Fallback chains for the LiteLLM gateway
+# Defines ordered model fallback sequences per use case
+version: "1.0"
+
+fallback_chains:
+  # Default chain for SOC analyst agents
+  default:
+    description: "Standard fallback chain for all SOC agent requests"
+    chain:
+      - model: claude-3-5-sonnet
+        provider: bedrock
+        model_id: "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"
+        max_retries: 2
+      - model: claude-3-haiku
+        provider: bedrock
+        model_id: "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
+        max_retries: 2
+      - model: vertex-gemini-pro
+        provider: vertex_ai
+        model_id: "vertex_ai/gemini-1.5-pro-002"
+        max_retries: 1
+    fallback_triggers:
+      - RateLimitError
+      - ServiceUnavailableError
+      - APIConnectionError
+      - Timeout
+
+  # High-fidelity reasoning chain for complex threat hunts
+  threat-hunt:
+    description: "High-capability models for complex threat hunting queries"
+    chain:
+      - model: claude-3-5-sonnet
+        provider: bedrock
+        model_id: "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"
+        max_retries: 3
+      - model: vertex-gemini-pro
+        provider: vertex_ai
+        model_id: "vertex_ai/gemini-1.5-pro-002"
+        max_retries: 2
+    fallback_triggers:
+      - RateLimitError
+      - ServiceUnavailableError
+      - APIConnectionError
+      - Timeout
+
+  # Cost-optimized chain for routine event ingestion
+  event-ingest:
+    description: "Cost-optimized chain for high-volume event processing"
+    chain:
+      - model: claude-3-haiku
+        provider: bedrock
+        model_id: "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
+        max_retries: 2
+      - model: vertex-gemini-flash
+        provider: vertex_ai
+        model_id: "vertex_ai/gemini-1.5-flash-002"
+        max_retries: 2
+    fallback_triggers:
+      - RateLimitError
+      - ServiceUnavailableError
+
+  # Complete disaster recovery — all models exhausted, use cached response
+  emergency:
+    description: "Emergency chain — all providers down, serve cached or degrade gracefully"
+    chain:
+      - model: claude-3-5-sonnet
+        provider: bedrock
+        max_retries: 3
+      - model: claude-3-haiku
+        provider: bedrock
+        max_retries: 3
+      - model: vertex-gemini-pro
+        provider: vertex_ai
+        max_retries: 2
+      - model: vertex-gemini-flash
+        provider: vertex_ai
+        max_retries: 2
+    on_all_failed:
+      action: return_cached_or_error
+      error_message: "All LLM providers are unavailable. Falling back to rule-based detection."

@@ -1,0 +1,79 @@
+# LiteLLM Gateway Configuration
+# Production configuration for the AI Agent SOC platform gateway
+version: "1.0"
+environment: production
+
+model_list:
+  # ──────────────────────────────────────────────────────────────────────
+  # Amazon Bedrock – Primary provider (us-east-1)
+  # ──────────────────────────────────────────────────────────────────────
+  - model_name: claude-3-5-sonnet
+    litellm_params:
+      model: "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"
+      aws_region_name: "us-east-1"
+      aws_access_key_id: "os.environ/AWS_ACCESS_KEY_ID"
+      aws_secret_access_key: "os.environ/AWS_SECRET_ACCESS_KEY"
+      aws_session_token: "os.environ/AWS_SESSION_TOKEN"
+    model_info:
+      max_tokens: 8192
+      max_input_tokens: 200000
+      supports_tool_use: true
+      provider: bedrock
+
+  - model_name: claude-3-haiku
+    litellm_params:
+      model: "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
+      aws_region_name: "us-east-1"
+      aws_access_key_id: "os.environ/AWS_ACCESS_KEY_ID"
+      aws_secret_access_key: "os.environ/AWS_SECRET_ACCESS_KEY"
+      aws_session_token: "os.environ/AWS_SESSION_TOKEN"
+    model_info:
+      max_tokens: 4096
+      max_input_tokens: 48000
+      supports_tool_use: true
+      provider: bedrock
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Vertex AI – Fallback provider
+  # ──────────────────────────────────────────────────────────────────────
+  - model_name: vertex-gemini-pro
+    litellm_params:
+      model: "vertex_ai/gemini-1.5-pro-002"
+      vertex_project: "os.environ/GCP_PROJECT_ID"
+      vertex_location: "us-central1"
+    model_info:
+      max_tokens: 8192
+      max_input_tokens: 1000000
+      supports_tool_use: true
+      provider: vertex_ai
+
+  - model_name: vertex-gemini-flash
+    litellm_params:
+      model: "vertex_ai/gemini-1.5-flash-002"
+      vertex_project: "os.environ/GCP_PROJECT_ID"
+      vertex_location: "us-central1"
+    model_info:
+      max_tokens: 8192
+      max_input_tokens: 1000000
+      supports_tool_use: true
+      provider: vertex_ai
+
+litellm_settings:
+  num_retries: 3
+  request_timeout: 60
+  retry_after: 1
+  allowed_fails: 2
+  cooldown_time: 60
+  set_verbose: false
+  json_logs: true
+  drop_params: false
+  success_callback:
+    - "opensearch"
+  failure_callback:
+    - "opensearch"
+
+general_settings:
+  master_key: "os.environ/LITELLM_MASTER_KEY"
+  database_url: "os.environ/DATABASE_URL"
+  disable_spend_logs: false
+  spend_log_db_connection_pool_limit: 10

@@ -1,0 +1,121 @@
+apiVersion: soar/v1
+kind: Playbook
+metadata:
+  name: disable-app
+  description: "Disable a malicious or compromised application to stop ongoing harm"
+  severity_threshold: HIGH
+  auto_approve: false
+  timeout_seconds: 300
+  timeout_action: deny
+  tags:
+    - incident-response
+    - application
+    - containment
+  version: "1.0"
+  author: "SOC Platform Team"
+spec:
+  steps:
+    - id: confirm_severity
+      name: "Confirm Incident Warrants Application Disable"
+      type: condition
+      condition: "incident.severity in ['CRITICAL', 'HIGH'] and incident.type in ['malicious_app', 'data_exfiltration', 'policy_violation_critical']"
+      on_true: get_dual_approval
+      on_false: abort
+      abort_message: "Application disable not warranted for severity {{ incident.severity }} / type {{ incident.type }}."
+
+    - id: get_dual_approval
+      name: "Request Dual T2 Approval"
+      type: approval
+      required_role: T2
+      required_approvals: 2
+      timeout_seconds: 300
+      timeout_action: deny
+      message: |
+        DUAL APPROVAL REQUIRED: Disable application {{ incident.app_id }}?
+        Incident ID: {{ incident.id }}
+        Severity: {{ incident.severity }}
+        Threat type: {{ incident.type }}
+        Tenant: {{ incident.tenant_id }}
+        WARNING: This will stop all operations of the affected application.
+      on_approved: call_disable_api
+      on_denied: abort
+
+    - id: call_disable_api
+      name: "Disable Application via Platform API"
+      type: api_call
+      endpoint: "{{ env.PLATFORM_API_URL }}/v1/applications/{{ incident.app_id }}/disable"
+      method: POST
+      auth: iam_role
+      body:
+        reason: "{{ incident.type }}"
+        incident_id: "{{ incident.id }}"
+        approved_by: "{{ approval.approvers }}"
+        disable_mode: "immediate"
+      retry:
+        max_attempts: 3
+        backoff_seconds: 5
+      on_success: verify_disabled
+      on_failure: notify_failure
+
+    - id: verify_disabled
+      name: "Verify Application Is Disabled"
+      type: api_call
+      endpoint: "{{ env.PLATFORM_API_URL }}/v1/applications/{{ incident.app_id }}/status"
+      method: GET
+      auth: iam_role
+      expected_result: "disabled"
+      retry:
+        max_attempts: 5
+        backoff_seconds: 10
+      on_success: notify_stakeholders
+      on_failure: notify_failure
+
+    - id: notify_stakeholders
+      name: "Notify Application Owners and SOC"
+      type: notification
+      channels:
+        - slack
+        - email
+        - pagerduty
+      recipients:
+        - "{{ incident.owner_email }}"
+        - "soc-team@example.com"
+        - "platform-team@example.com"
+      message: |
+        Application {{ incident.app_id }} has been DISABLED.
+        Incident: {{ incident.id }}
+        Severity: {{ incident.severity }}
+        Reason: {{ incident.type }}
+        Approved by: {{ approval.approvers | join(', ') }}
+        Tenant: {{ incident.tenant_id }}
+        Re-enable requires CISO approval via incident {{ incident.id }}.
+      on_complete: update_incident
+
+    - id: notify_failure
+      name: "Alert on Disable Failure"
+      type: notification
+      channels:
+        - pagerduty
+        - slack
+      recipients:
+        - "on-call@example.com"
+        - "soc-team@example.com"
+      message: |
+        CRITICAL: Failed to disable application {{ incident.app_id }}.
+        Incident: {{ incident.id }}
+        Immediate manual intervention required.
+        Escalate to CISO immediately.
+      on_complete: abort
+
+    - id: update_incident
+      name: "Update Incident Status"
+      type: api_call
+      endpoint: "{{ env.SOC_API_URL }}/api/v1/incidents/{{ incident.id }}"
+      method: PATCH
+      auth: iam_role
+      body:
+        status: "contained"
+        containment_action: "application_disabled"
+        containment_timestamp: "{{ now() }}"
+        containment_approvers: "{{ approval.approvers }}"
+        re_enable_requires: "ciso_approval"

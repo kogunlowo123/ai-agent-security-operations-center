@@ -1,0 +1,68 @@
+title: AI Agent SOC Anomalous Access Pattern
+id: 7a3f91c2-4e8d-4b2a-9f1e-3d6a8c2b5f7e
+status: stable
+description: >
+  Detects unusual access patterns in SOC agent activity including privilege
+  escalation attempts, off-hours access, cross-tenant requests, and abnormally
+  high event volumes that may indicate a compromised or misbehaving agent.
+references:
+  - https://attack.mitre.org/techniques/T1548/
+  - https://attack.mitre.org/techniques/T1078/
+author: AI Agent SOC Security Team
+date: 2025-01-01
+modified: 2025-01-01
+tags:
+  - attack.privilege_escalation
+  - attack.T1548
+  - attack.initial_access
+  - attack.T1078
+  - soc.anomaly
+logsource:
+  product: opensearch
+  service: soc-events
+detection:
+  selection_privilege_escalation:
+    event_type|contains:
+      - "scope_denied"
+      - "tier_upgrade_request"
+      - "unauthorized_resource_access"
+    response_code:
+      - 403
+      - 401
+  selection_off_hours:
+    event_type: "agent_authenticated"
+    hour|lt: 6
+    hour|gt: 22
+    agent_tier|contains:
+      - "T2"
+      - "T3"
+  selection_cross_tenant:
+    event_type: "access_denied"
+    reason: "tenant_mismatch"
+  selection_high_volume:
+    event_type: "events:ingest"
+    count|gte: 500
+    timeframe: "5m"
+  selection_hunt_abuse:
+    event_type: "hunt:launch"
+    count|gte: 10
+    timeframe: "1h"
+  condition: >
+    1 of selection_privilege_escalation or
+    selection_off_hours or
+    selection_cross_tenant or
+    selection_high_volume or
+    selection_hunt_abuse
+fields:
+  - agent_id
+  - tenant_id
+  - event_type
+  - source_ip
+  - response_code
+  - reason
+  - timestamp
+falsepositives:
+  - Scheduled batch jobs running during maintenance windows
+  - Authorized penetration testing activities
+  - Bulk data migrations
+level: high

@@ -1,0 +1,21 @@
+apiVersion: v2
+name: soc-api
+description: AI Agent SOC API Service - FastAPI event ingestion and incident management
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - security
+  - soc
+  - ai-agent
+  - fastapi
+home: https://github.com/kogunlowo123/ai-agent-security-operations-center
+sources:
+  - https://github.com/kogunlowo123/ai-agent-security-operations-center
+maintainers:
+  - name: SOC Platform Team
+dependencies:
+  - name: common
+    version: ">=1.0.0"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: common.enabled

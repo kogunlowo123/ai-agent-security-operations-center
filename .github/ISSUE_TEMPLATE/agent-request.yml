@@ -1,0 +1,187 @@
+name: Agent Capability Request
+description: Request a new AI agent or capability for the Security Operations Center
+title: "[Agent Request]: "
+labels:
+  - "agent-request"
+  - "enhancement"
+  - "needs-triage"
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## New Agent or Capability Request
+        Use this form to propose a new AI agent, extend an existing agent's capabilities, or integrate a new security data source or tool.
+
+        All new agents will undergo security review including threat modeling for prompt injection, privilege escalation, and unintended actions.
+
+  - type: dropdown
+    id: request-type
+    attributes:
+      label: Request Type
+      description: What type of request is this?
+      options:
+        - New agent (end-to-end, new capability)
+        - Extend existing agent (new tool or skill)
+        - New data source integration
+        - New API / tool integration
+        - Agent orchestration / workflow
+        - Performance improvement to existing agent
+    validations:
+      required: true
+
+  - type: dropdown
+    id: security-domain
+    attributes:
+      label: Security Domain
+      description: Which security domain does this capability address?
+      options:
+        - Threat Detection & Hunting
+        - Incident Response & Triage
+        - Vulnerability Management
+        - Log Analysis & SIEM
+        - Identity & Access Management
+        - Network Security Monitoring
+        - Cloud Security Posture Management
+        - Endpoint Detection & Response
+        - Threat Intelligence
+        - Compliance & Audit
+        - Forensics & Investigation
+        - Red Team / Offensive Security
+        - Cross-domain / General SOC
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem-statement
+    attributes:
+      label: Problem Statement
+      description: |
+        What security problem or analyst pain point does this solve?
+        Be specific about the current gap or limitation.
+      placeholder: "Currently, analysts must manually correlate alerts from X and Y, which takes ~2 hours per incident. An agent that automates this would..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed Solution
+      description: |
+        Describe the agent or capability you are requesting.
+        Include: what the agent should do, what inputs it consumes, what outputs/actions it produces.
+      placeholder: |
+        Agent name: CorrelationAgent
+
+        Inputs:
+        - Raw alerts from SIEM (Splunk/Elastic)
+        - Asset inventory from CMDB
+
+        Actions/Outputs:
+        - Correlates related alerts into a single incident
+        - Enriches with asset owner context
+        - Drafts incident ticket with severity score
+
+        Trigger: New high-severity alert in SIEM
+    validations:
+      required: true
+
+  - type: textarea
+    id: data-sources
+    attributes:
+      label: Data Sources and Integrations Required
+      description: List all data sources, APIs, or tools this agent needs access to.
+      placeholder: |
+        - Splunk REST API (read alerts, run SPL queries)
+        - ServiceNow API (create/update incidents)
+        - Okta API (user identity enrichment)
+        - Internal CMDB API
+
+  - type: dropdown
+    id: autonomy-level
+    attributes:
+      label: Requested Autonomy Level
+      description: |
+        How autonomously should this agent act?
+        Higher autonomy = more risk review required.
+      options:
+        - "Read-only: Agent only reads data and surfaces findings (no writes)"
+        - "Recommend: Agent proposes actions, human approves each one"
+        - "Semi-autonomous: Agent acts on low-risk tasks, escalates high-risk"
+        - "Fully autonomous: Agent acts without human approval (requires exec sign-off)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: human-in-loop
+    attributes:
+      label: Human-in-the-Loop Requirements
+      description: |
+        Describe when and how a human analyst should be involved.
+        What decisions must always require human approval?
+      placeholder: |
+        - Agent may auto-close false positives below confidence threshold 0.95
+        - Agent must always escalate to on-call analyst for P1 incidents
+        - Agent may not execute containment actions (isolate host, block IP) without CISO approval
+
+  - type: textarea
+    id: success-criteria
+    attributes:
+      label: Success Criteria / Acceptance Criteria
+      description: How will we know this agent is working correctly? Define measurable outcomes.
+      placeholder: |
+        - Reduces mean time to triage (MTTT) from 2h to <15 minutes
+        - False positive rate < 5% on test dataset
+        - Agent correctly classifies 95%+ of test cases in evaluation suite
+        - Zero unauthorized write actions in red team testing
+
+  - type: textarea
+    id: threat-model
+    attributes:
+      label: Preliminary Threat Model
+      description: |
+        What could go wrong? Identify potential risks or misuse scenarios for this agent.
+        The security team will conduct a full review, but initial thoughts help prioritize.
+      placeholder: |
+        - Prompt injection via malicious alert payloads
+        - Over-privileged tool access (agent can read beyond its scope)
+        - False negative rate causing missed incidents
+        - API rate limiting causing alert backlog
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Business Priority
+      description: How urgent is this capability?
+      options:
+        - "Critical – Active security gap, needed immediately"
+        - "High – Significant analyst efficiency gain, needed this quarter"
+        - "Medium – Valuable improvement, plan for next quarter"
+        - "Low – Nice to have, no specific timeline"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Have you considered other approaches? Why is an AI agent the right solution?
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Any supporting documentation, research, or examples from other SOCs.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true
+        - label: I have described the problem (not just the solution).
+          required: true
+        - label: I understand this request will undergo security and threat model review.
+          required: true

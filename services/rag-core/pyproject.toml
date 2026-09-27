@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rag-core"
+version = "0.1.0"
+description = "MITRE ATT&CK RAG corpus ingestion, chunking, embedding, and retrieval for the AI Agent SOC"
+requires-python = ">=3.12"
+dependencies = [
+    "sentence-transformers>=3.0.0",
+    "psycopg2-binary>=2.9.9",
+    "pgvector>=0.3.0",
+    "asyncpg>=0.29.0",
+    "opensearch-py>=2.5.0",
+    "litellm>=1.40.0",
+    "pydantic>=2.7.0",
+    "boto3>=1.34.0",
+    "tenacity>=8.3.0",
+    "httpx>=0.27.0",
+    "stix2>=3.0.0",
+    "mitreattack-python>=3.0.0",
+    "opentelemetry-sdk>=1.24.0",
+    "opentelemetry-exporter-otlp>=1.24.0",
+    "structlog>=24.1.0",
+    "numpy>=1.26.0",
+    "scipy>=1.13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

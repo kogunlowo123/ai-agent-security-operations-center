@@ -1,0 +1,153 @@
+name: isolate-host
+version: "1.0"
+description: >
+  Isolate a compromised host from the network. Applies security group
+  restriction (AWS), network policy (Kubernetes), and notifies the
+  infrastructure team for physical/hypervisor-level verification.
+trigger:
+  event_types:
+    - runtime.guardrail.triggered
+    - identity.access.violation
+  conditions:
+    - field: severity
+      operator: in
+      values: [CRITICAL, HIGH]
+    - field: payload.host_id
+      operator: exists
+
+approval:
+  required: true
+  approvers:
+    - role: soc-lead
+    - role: incident-commander
+  timeout_minutes: 15
+  escalation_on_timeout:
+    - role: ciso
+
+steps:
+  - id: validate_host
+    name: Validate Host Identity
+    type: api_call
+    config:
+      method: GET
+      url: "https://cmdb.internal/hosts/{payload.host_id}"
+      headers:
+        Authorization: "Bearer {secrets.cmdb_token}"
+    on_failure:
+      action: abort
+      message: "Cannot validate host. Aborting isolation to prevent outage on unknown resource."
+
+  - id: snapshot_host
+    name: Capture Pre-Isolation Snapshot
+    type: aws_action
+    config:
+      action: ec2.create_snapshot
+      parameters:
+        instance_id: "{payload.host_id}"
+        description: "SOC isolation snapshot - incident {incident_id} - {timestamp}"
+        tags:
+          - Key: soc-incident-id
+            Value: "{incident_id}"
+          - Key: isolation-timestamp
+            Value: "{timestamp}"
+    parallel: false
+
+  - id: revoke_security_group
+    name: Apply Isolation Security Group (AWS)
+    type: aws_action
+    config:
+      action: ec2.modify_instance_attribute
+      parameters:
+        instance_id: "{payload.host_id}"
+        groups:
+          - "{config.isolation_sg_id}"
+    rollback:
+      action: ec2.modify_instance_attribute
+      parameters:
+        instance_id: "{payload.host_id}"
+        groups: "{snapshot.original_security_groups}"
+
+  - id: apply_network_policy
+    name: Apply Kubernetes Network Policy (if pod)
+    type: kubernetes_action
+    config:
+      action: apply_manifest
+      manifest:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: "soc-isolate-{payload.pod_name}"
+          namespace: "{payload.namespace}"
+          labels:
+            soc-incident-id: "{incident_id}"
+        spec:
+          podSelector:
+            matchLabels:
+              app: "{payload.pod_name}"
+          policyTypes:
+            - Ingress
+            - Egress
+    condition: "payload.pod_name != null"
+
+  - id: revoke_iam_credentials
+    name: Revoke IAM Instance Profile Credentials
+    type: aws_action
+    config:
+      action: iam.delete_role_policy
+      parameters:
+        role_name: "{payload.instance_profile_role}"
+        policy_name: "soc-emergency-revoke-{incident_id}"
+    condition: "payload.instance_profile_role != null"
+
+  - id: notify_team
+    name: Notify Infrastructure Team
+    type: notification
+    config:
+      channels:
+        - slack:
+            channel: "#soc-critical"
+            message: |
+              :rotating_light: *Host Isolation Executed*
+              Incident: {incident_id}
+              Host: {payload.host_id}
+              Reason: {payload.trigger_reason}
+              Isolated by: SOC automation
+              Time: {timestamp}
+              *Next step*: Verify physical/hypervisor status and prepare forensic analysis.
+        - pagerduty:
+            service_key: "{secrets.pagerduty_infra_key}"
+            severity: critical
+            summary: "Host {payload.host_id} isolated - incident {incident_id}"
+
+  - id: create_forensic_ticket
+    name: Create Forensic Analysis Ticket
+    type: jira_action
+    config:
+      action: create_issue
+      parameters:
+        project: SECOPS
+        issue_type: Incident
+        summary: "Forensic analysis required: isolated host {payload.host_id}"
+        description: |
+          Host has been isolated by SOC automation.
+
+          Incident ID: {incident_id}
+          Host ID: {payload.host_id}
+          Snapshot ID: {steps.snapshot_host.snapshot_id}
+          Isolation time: {timestamp}
+
+          Required actions:
+          1. Mount and analyse snapshot
+          2. Review CloudTrail logs for the 24h prior to isolation
+          3. Check for lateral movement to adjacent hosts
+        priority: High
+        labels:
+          - forensics
+          - soc-automated
+          - incident-{incident_id}
+
+outputs:
+  - snapshot_id: "{steps.snapshot_host.snapshot_id}"
+  - isolation_sg_id: "{config.isolation_sg_id}"
+  - forensic_ticket_id: "{steps.create_forensic_ticket.issue_key}"
+  - isolated_at: "{timestamp}"

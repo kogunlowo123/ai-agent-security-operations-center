@@ -1,0 +1,117 @@
+replicaCount: 2
+
+image:
+  repository: ""  # Set via CI: <ecr-account>.dkr.ecr.<region>.amazonaws.com/soc-api
+  pullPolicy: IfNotPresent
+  tag: ""  # Overridden by ArgoCD with image digest
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: ""  # Set via environment overlay
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/path: "/metrics"
+  prometheus.io/port: "8000"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 2000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+  hosts:
+    - host: soc-api.internal
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: soc-api-tls
+      hosts:
+        - soc-api.internal
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# KEDA ScaledObject for SQS-based scaling
+keda:
+  enabled: true
+  scaledObject:
+    pollingInterval: 10
+    cooldownPeriod: 60
+    minReplicaCount: 2
+    maxReplicaCount: 20
+    triggers:
+      - type: aws-sqs-queue
+        metadata:
+          queueURL: ""  # Set via overlay
+          queueLength: "10"
+          awsRegion: us-east-1
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+
+nodeSelector: {}
+tolerations: []
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - soc-api
+          topologyKey: kubernetes.io/hostname
+
+extraEnvFrom:
+  - secretRef:
+      name: soc-api-secrets
+  - configMapRef:
+      name: soc-api-config

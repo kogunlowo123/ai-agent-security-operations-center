@@ -1,0 +1,370 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (must already exist)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Validate release tag and extract version
+  # ─────────────────────────────────────────────
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      semver: ${{ steps.version.outputs.semver }}
+      is-prerelease: ${{ steps.version.outputs.is-prerelease }}
+      release-tag: ${{ steps.version.outputs.release-tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for CHANGELOG generation
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "Release tag: $TAG"
+
+          # Strip leading 'v'
+          SEMVER="${TAG#v}"
+
+          # Detect pre-release
+          if [[ "$SEMVER" == *"-rc."* ]] || [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
+            IS_PRERELEASE="true"
+          else
+            IS_PRERELEASE="false"
+          fi
+
+          echo "version=$TAG" >> $GITHUB_OUTPUT
+          echo "semver=$SEMVER" >> $GITHUB_OUTPUT
+          echo "is-prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          echo "release-tag=$TAG" >> $GITHUB_OUTPUT
+
+          echo "Version: $SEMVER (pre-release: $IS_PRERELEASE)"
+
+      - name: Validate version in pyproject.toml matches tag
+        run: |
+          TOML_VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          TAG_VERSION="${{ steps.version.outputs.semver }}"
+
+          if [[ "$TOML_VERSION" != "$TAG_VERSION" ]]; then
+            echo "ERROR: pyproject.toml version ($TOML_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+          echo "Version match confirmed: $TOML_VERSION"
+
+  # ─────────────────────────────────────────────
+  # Job 2: Build Python distribution
+  # ─────────────────────────────────────────────
+  build-python:
+    name: Build Python Distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [prepare]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python with uv
+        uses: ./.github/actions/setup-python
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          install-dev-deps: "false"
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Verify distribution
+        run: |
+          uv run twine check dist/*
+          ls -lh dist/
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist-${{ needs.prepare.outputs.semver }}
+          path: dist/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Job 3: Build and push Docker images to ECR
+  # ─────────────────────────────────────────────
+  build-push-images:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [prepare]
+
+    permissions:
+      id-token: write
+      contents: read
+
+    strategy:
+      matrix:
+        image:
+          - name: api
+            dockerfile: docker/api/Dockerfile
+            ecr-repo: ai-agent-soc/api
+          - name: agent-runtime
+            dockerfile: docker/agent-runtime/Dockerfile
+            ecr-repo: ai-agent-soc/agent-runtime
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and push ${{ matrix.image.name }} image
+        id: build-push
+        uses: ./.github/actions/docker-build-push
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          ecr-repository: ${{ matrix.image.ecr-repo }}
+          image-tag: ${{ needs.prepare.outputs.semver }}
+          dockerfile: ${{ matrix.image.dockerfile }}
+          context: .
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            APP_VERSION=${{ needs.prepare.outputs.semver }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_COMMIT=${{ github.sha }}
+          push: "true"
+
+      - name: Record image digest
+        run: |
+          echo "Image: ${{ steps.build-push.outputs.image-uri }}"
+          echo "Digest: ${{ steps.build-push.outputs.image-digest }}"
+
+  # ─────────────────────────────────────────────
+  # Job 4: Update CHANGELOG
+  # ─────────────────────────────────────────────
+  update-changelog:
+    name: Update CHANGELOG
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [prepare]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Generate CHANGELOG entry
+        id: changelog
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGES_LATEST.md
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepend to CHANGELOG.md
+        run: |
+          # Build new CHANGELOG with latest changes at top
+          {
+            echo "# Changelog"
+            echo ""
+            cat CHANGES_LATEST.md
+            echo ""
+            # Append existing content (skip the first '# Changelog' line)
+            tail -n +2 CHANGELOG.md || true
+          } > CHANGELOG.new.md
+          mv CHANGELOG.new.md CHANGELOG.md
+
+      - name: Commit CHANGELOG update
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git diff --staged --quiet || git commit -m "docs(changelog): update for ${{ needs.prepare.outputs.version }}"
+          git push origin HEAD:main
+
+      - name: Save changelog for release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog-${{ needs.prepare.outputs.semver }}
+          path: CHANGES_LATEST.md
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Job 5: Create GitHub Release
+  # ─────────────────────────────────────────────
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [prepare, build-python, build-push-images, update-changelog]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Python dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist-${{ needs.prepare.outputs.semver }}
+          path: dist/
+
+      - name: Download CHANGELOG artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog-${{ needs.prepare.outputs.semver }}
+          path: ./release-notes/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: "${{ needs.prepare.outputs.version }}"
+          body_path: ./release-notes/CHANGES_LATEST.md
+          prerelease: ${{ needs.prepare.outputs.is-prerelease == 'true' }}
+          draft: false
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          generate_release_notes: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─────────────────────────────────────────────
+  # Job 6: Deploy to staging/prod after release
+  # ─────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [prepare, create-release]
+    if: needs.prepare.outputs.is-prerelease == 'false'
+
+    environment: staging
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: ReleaseDeploy-staging-${{ github.run_id }}
+
+      - name: Update ECS services with new image version
+        run: |
+          VERSION="${{ needs.prepare.outputs.semver }}"
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+
+          # Update API service
+          aws ecs update-service \
+            --cluster ai-agent-soc-staging \
+            --service api \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
+
+          # Update agent-runtime service
+          aws ecs update-service \
+            --cluster ai-agent-soc-staging \
+            --service agent-runtime \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
+
+          echo "Deployment triggered for version $VERSION to staging"
+
+      - name: Wait for ECS services to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster ai-agent-soc-staging \
+            --services api agent-runtime \
+            --region ${{ secrets.AWS_REGION }}
+
+          echo "Staging deployment stable"
+
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [prepare, deploy-staging]
+    if: needs.prepare.outputs.is-prerelease == 'false'
+
+    environment: production  # Requires manual approval via GitHub environment protection rules
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: ReleaseDeploy-prod-${{ github.run_id }}
+
+      - name: Update ECS services with new image version (production)
+        run: |
+          VERSION="${{ needs.prepare.outputs.semver }}"
+
+          aws ecs update-service \
+            --cluster ai-agent-soc-prod \
+            --service api \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
+
+          aws ecs update-service \
+            --cluster ai-agent-soc-prod \
+            --service agent-runtime \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
+
+          echo "Production deployment triggered for version $VERSION"
+
+      - name: Wait for ECS services to stabilize (production)
+        run: |
+          aws ecs wait services-stable \
+            --cluster ai-agent-soc-prod \
+            --services api agent-runtime \
+            --region ${{ secrets.AWS_REGION }}
+
+          echo "Production deployment stable. Version ${{ needs.prepare.outputs.semver }} is live."

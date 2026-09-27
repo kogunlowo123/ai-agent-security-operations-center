@@ -1,0 +1,145 @@
+name: revoke-session
+version: "1.0"
+description: >
+  Revoke all active sessions for a compromised principal. Invalidates
+  JWTs, revokes OAuth tokens, terminates AWS sessions, and forces
+  re-authentication across all platforms.
+trigger:
+  event_types:
+    - identity.access.violation
+    - identity.token.anomaly
+  conditions:
+    - field: severity
+      operator: in
+      values: [CRITICAL, HIGH]
+    - field: payload.principal_id
+      operator: exists
+
+approval:
+  required: true
+  approvers:
+    - role: soc-analyst
+    - role: identity-team-lead
+  timeout_minutes: 10
+  escalation_on_timeout:
+    - role: soc-lead
+
+steps:
+  - id: enumerate_sessions
+    name: Enumerate Active Sessions
+    type: api_call
+    config:
+      method: GET
+      url: "https://soc-api.internal/api/v1/identity/sessions/{payload.principal_id}"
+      headers:
+        Authorization: "Bearer {secrets.soc_service_token}"
+    on_failure:
+      action: continue
+      message: "Session enumeration failed. Proceeding with best-effort revocation."
+
+  - id: invalidate_jwt_blocklist
+    name: Add JWT JTI to Blocklist
+    type: api_call
+    config:
+      method: POST
+      url: "https://soc-api.internal/api/v1/identity/jwt/blocklist"
+      headers:
+        Authorization: "Bearer {secrets.soc_service_token}"
+        Content-Type: application/json
+      body:
+        principal_id: "{payload.principal_id}"
+        reason: "soc-revocation"
+        incident_id: "{incident_id}"
+        expires_at: "{timestamp + 86400}"
+
+  - id: revoke_aws_sessions
+    name: Revoke AWS IAM Sessions
+    type: aws_action
+    config:
+      action: iam.put_role_policy
+      parameters:
+        role_name: "{payload.iam_role}"
+        policy_name: "soc-deny-all-{incident_id}"
+        policy_document:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Deny
+              Action: "*"
+              Resource: "*"
+              Condition:
+                DateLessThan:
+                  aws:TokenIssueTime: "{timestamp}"
+    condition: "payload.iam_role != null"
+
+  - id: revoke_azure_tokens
+    name: Revoke Azure AD Tokens
+    type: azure_action
+    config:
+      action: graph.revoke_sign_in_sessions
+      parameters:
+        user_principal_name: "{payload.azure_upn}"
+    condition: "payload.azure_upn != null"
+
+  - id: revoke_gcp_service_account
+    name: Disable GCP Service Account Key
+    type: gcp_action
+    config:
+      action: iam.disable_service_account_key
+      parameters:
+        service_account: "{payload.gcp_service_account}"
+        key_id: "{payload.gcp_key_id}"
+    condition: "payload.gcp_service_account != null"
+
+  - id: terminate_k8s_pods
+    name: Terminate Agent Pods Using Compromised Identity
+    type: kubernetes_action
+    config:
+      action: delete_pods
+      parameters:
+        label_selector: "principal-id={payload.principal_id}"
+        namespace: "{payload.namespace}"
+        grace_period_seconds: 0
+    condition: "payload.namespace != null"
+
+  - id: notify_principal
+    name: Notify Affected Principal
+    type: notification
+    config:
+      channels:
+        - email:
+            to: "{payload.principal_email}"
+            subject: "Security Alert: Your account sessions have been revoked"
+            template: session_revocation_user_notice
+            variables:
+              principal_id: "{payload.principal_id}"
+              incident_id: "{incident_id}"
+              revocation_time: "{timestamp}"
+              contact_email: "security@company.com"
+        - slack:
+            channel: "#soc-critical"
+            message: |
+              :key: *Session Revocation Executed*
+              Principal: {payload.principal_id}
+              Incident: {incident_id}
+              Sessions revoked: {steps.enumerate_sessions.count}
+              AWS sessions: revoked
+              Reason: {payload.trigger_reason}
+              Time: {timestamp}
+
+  - id: update_siem
+    name: Index Revocation Event to SIEM
+    type: opensearch_index
+    config:
+      index: "soc-remediations-{YYYY.MM}"
+      document:
+        type: session_revocation
+        principal_id: "{payload.principal_id}"
+        incident_id: "{incident_id}"
+        sessions_revoked: "{steps.enumerate_sessions.session_ids}"
+        aws_revoked: true
+        timestamp: "{timestamp}"
+
+outputs:
+  - sessions_revoked: "{steps.enumerate_sessions.count}"
+  - aws_deny_policy: "soc-deny-all-{incident_id}"
+  - revoked_at: "{timestamp}"

@@ -1,0 +1,65 @@
+# EditorConfig: https://editorconfig.org
+root = true
+
+# ─── Defaults ────────────────────────────────────────────────────────────────
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 120
+
+# ─── YAML ────────────────────────────────────────────────────────────────────
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# ─── JSON ────────────────────────────────────────────────────────────────────
+[*.json]
+indent_style = space
+indent_size = 2
+
+# ─── Terraform ───────────────────────────────────────────────────────────────
+[*.tf]
+indent_style = space
+indent_size = 2
+
+[*.tfvars]
+indent_style = space
+indent_size = 2
+
+# ─── Markdown ────────────────────────────────────────────────────────────────
+[*.md]
+trim_trailing_whitespace = false
+indent_size = 2
+
+# ─── Makefile ────────────────────────────────────────────────────────────────
+[Makefile]
+indent_style = tab
+
+# ─── Shell ───────────────────────────────────────────────────────────────────
+[*.sh]
+indent_style = space
+indent_size = 4
+
+# ─── Dockerfile ──────────────────────────────────────────────────────────────
+[Dockerfile*]
+indent_style = space
+indent_size = 4
+
+# ─── TOML ────────────────────────────────────────────────────────────────────
+[*.toml]
+indent_style = space
+indent_size = 4
+
+# ─── HTML / CSS / JS / TS ───────────────────────────────────────────────────
+[*.{html,css,js,ts,jsx,tsx}]
+indent_style = space
+indent_size = 2

@@ -1,0 +1,67 @@
+# UEBA Behavioral Baselines for AI Agents
+version: "1.0"
+description: "Defines expected behavioral baselines per agent tier and anomaly detection thresholds"
+
+baselines:
+  T1:
+    description: "Tier-1 SOC analyst agents — limited read/ingest operations"
+    max_events_per_hour: 100
+    max_tool_calls_per_session: 50
+    max_api_calls_per_minute: 20
+    allowed_hours:
+      start: "06:00"
+      end: "22:00"
+      timezone: "UTC"
+    allowed_operations:
+      - "events:ingest"
+      - "events:read"
+      - "incidents:read"
+      - "posture:read"
+    max_distinct_tenants_per_session: 1
+    max_session_duration_minutes: 60
+
+  T2:
+    description: "Tier-2 threat hunter agents — elevated operations with approval gates"
+    max_events_per_hour: 50
+    max_tool_calls_per_session: 30
+    max_api_calls_per_minute: 10
+    max_hunt_launches_per_hour: 5
+    max_concurrent_hunts: 2
+    allowed_hours:
+      start: "00:00"
+      end: "23:59"
+      timezone: "UTC"
+    allowed_operations:
+      - "events:ingest"
+      - "events:read"
+      - "incidents:read"
+      - "incidents:write"
+      - "posture:read"
+      - "posture:write"
+      - "hunt:launch"
+      - "hunt:read"
+    requires_approval_for:
+      - "delete"
+      - "revoke"
+      - "isolate"
+      - "disable"
+    max_distinct_tenants_per_session: 1
+    max_session_duration_minutes: 120
+
+anomaly_thresholds:
+  description: "Multipliers above baseline that trigger alerts"
+  levels:
+    MEDIUM:
+      multiplier: 2.0
+      action: "log_and_alert"
+    HIGH:
+      multiplier: 5.0
+      action: "alert_and_throttle"
+    CRITICAL:
+      multiplier: 10.0
+      action: "alert_and_block"
+
+detection_windows:
+  short_window_minutes: 5
+  medium_window_minutes: 60
+  long_window_hours: 24

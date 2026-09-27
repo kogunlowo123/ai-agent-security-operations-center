@@ -1,0 +1,349 @@
+name: Security Scanning
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Run daily at 02:00 UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Trivy (container vulnerability scanning)
+  # ─────────────────────────────────────────────
+  trivy:
+    name: Trivy Container Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      security-events: write
+
+    strategy:
+      matrix:
+        image:
+          - name: api
+            dockerfile: docker/api/Dockerfile
+          - name: agent-runtime
+            dockerfile: docker/agent-runtime/Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image for scanning
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: false
+          tags: ai-agent-soc/${{ matrix.image.name }}:scan-${{ github.sha }}
+          load: true
+
+      - name: Run Trivy vulnerability scanner (container)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "ai-agent-soc/${{ matrix.image.name }}:scan-${{ github.sha }}"
+          format: "sarif"
+          output: "trivy-${{ matrix.image.name }}-results.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM"
+          ignore-unfixed: false
+          vuln-type: "os,library"
+          trivyignores: ".trivyignore"
+
+      - name: Upload Trivy scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-${{ matrix.image.name }}-results.sarif"
+          category: "trivy-${{ matrix.image.name }}"
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-fs-results.sarif"
+          severity: "CRITICAL,HIGH"
+          skip-dirs: ".git,node_modules,.venv,__pycache__"
+
+      - name: Upload Trivy filesystem scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-fs-results.sarif"
+          category: "trivy-filesystem"
+
+  # ─────────────────────────────────────────────
+  # Job 2: Bandit (Python SAST)
+  # ─────────────────────────────────────────────
+  bandit:
+    name: Bandit Python SAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python with uv
+        uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.12"
+          install-dev-deps: "true"
+
+      - name: Run Bandit
+        run: |
+          uv run bandit \
+            -r src/ \
+            -f sarif \
+            -o bandit-results.sarif \
+            --severity-level medium \
+            --confidence-level medium \
+            -x tests/,scripts/ \
+            || true  # Don't fail here; let SARIF upload handle severity gate
+
+      - name: Upload Bandit SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: bandit-results.sarif
+          category: "bandit"
+
+      - name: Run Bandit (fail on high/critical)
+        run: |
+          uv run bandit \
+            -r src/ \
+            --severity-level high \
+            --confidence-level high \
+            -x tests/,scripts/ \
+            -f txt
+
+  # ─────────────────────────────────────────────
+  # Job 3: Checkov (IaC scanning)
+  # ─────────────────────────────────────────────
+  checkov:
+    name: Checkov IaC Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov on Terraform
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infra/
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-terraform-results.sarif
+          soft_fail: false
+          skip_check: >-
+            CKV_AWS_144,CKV_AWS_145
+          download_external_modules: false
+
+      - name: Upload Checkov Terraform SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-terraform-results.sarif
+          category: "checkov-terraform"
+
+      - name: Run Checkov on Dockerfiles
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: docker/
+          framework: dockerfile
+          output_format: sarif
+          output_file_path: checkov-docker-results.sarif
+          soft_fail: true  # Docker checks are advisory
+
+      - name: Upload Checkov Docker SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-docker-results.sarif
+          category: "checkov-docker"
+
+      - name: Run Checkov on GitHub Actions workflows
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .github/workflows/
+          framework: github_actions
+          output_format: sarif
+          output_file_path: checkov-gha-results.sarif
+          soft_fail: true
+
+      - name: Upload Checkov GHA SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-gha-results.sarif
+          category: "checkov-gha"
+
+  # ─────────────────────────────────────────────
+  # Job 4: Semgrep (semantic code analysis)
+  # ─────────────────────────────────────────────
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Don't run on dependabot PRs (semgrep can't access secrets for those)
+    if: github.actor != 'dependabot[bot]'
+
+    permissions:
+      contents: read
+      security-events: write
+
+    container:
+      image: semgrep/semgrep:latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep (CI mode with SARIF output)
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          semgrep ci \
+            --sarif \
+            --output semgrep-results.sarif \
+            --config p/python \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --config p/supply-chain \
+            --config p/ai-security-guidelines \
+            || true
+
+      - name: Upload Semgrep SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep-results.sarif
+          category: "semgrep"
+
+  # ─────────────────────────────────────────────
+  # Job 5: pip-audit (Python dependency audit)
+  # ─────────────────────────────────────────────
+  pip-audit:
+    name: pip-audit Dependency Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python with uv
+        uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.12"
+          install-dev-deps: "false"
+
+      - name: Run pip-audit
+        run: |
+          uv run pip-audit \
+            --requirement requirements.txt \
+            --format json \
+            --output pip-audit-results.json \
+            --progress-spinner off \
+            || true
+
+      - name: Upload pip-audit results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-results-${{ github.sha }}
+          path: pip-audit-results.json
+          retention-days: 30
+
+      - name: Fail on critical CVEs
+        run: |
+          uv run pip-audit \
+            --requirement requirements.txt \
+            --severity critical \
+            --progress-spinner off
+
+  # ─────────────────────────────────────────────
+  # Job 6: Secret scanning (gitleaks)
+  # ─────────────────────────────────────────────
+  gitleaks:
+    name: Gitleaks Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout (full history for secret scanning)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # ─────────────────────────────────────────────
+  # Security gate: all scans must pass
+  # ─────────────────────────────────────────────
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    needs: [trivy, bandit, checkov, semgrep, pip-audit, gitleaks]
+    if: always()
+
+    steps:
+      - name: Check security scan results
+        run: |
+          results=(
+            "trivy:${{ needs.trivy.result }}"
+            "bandit:${{ needs.bandit.result }}"
+            "checkov:${{ needs.checkov.result }}"
+            "semgrep:${{ needs.semgrep.result }}"
+            "pip-audit:${{ needs.pip-audit.result }}"
+            "gitleaks:${{ needs.gitleaks.result }}"
+          )
+
+          failed=()
+          for r in "${results[@]}"; do
+            name="${r%%:*}"
+            status="${r##*:}"
+            if [[ "$status" == "failure" ]]; then
+              failed+=("$name")
+            fi
+          done
+
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "The following security scans failed: ${failed[*]}"
+            exit 1
+          fi
+
+          echo "All security scans passed or were skipped."

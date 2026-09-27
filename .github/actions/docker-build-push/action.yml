@@ -1,0 +1,130 @@
+name: "Docker Build and Push to ECR"
+description: "Builds a Docker image and pushes it to Amazon ECR with multi-platform support and layer caching"
+
+inputs:
+  aws-region:
+    description: "AWS region for ECR"
+    required: false
+    default: "us-east-1"
+  ecr-repository:
+    description: "ECR repository name (without the registry prefix)"
+    required: true
+  image-tag:
+    description: "Docker image tag"
+    required: false
+    default: ${{ github.sha }}
+  dockerfile:
+    description: "Path to Dockerfile"
+    required: false
+    default: "Dockerfile"
+  context:
+    description: "Docker build context path"
+    required: false
+    default: "."
+  build-args:
+    description: "Docker build arguments (multiline, one per line: KEY=VALUE)"
+    required: false
+    default: ""
+  platforms:
+    description: "Target platforms for multi-arch build"
+    required: false
+    default: "linux/amd64"
+  push:
+    description: "Whether to push to ECR (set to false for PR builds)"
+    required: false
+    default: "true"
+  aws-role-arn:
+    description: "ARN of the IAM role to assume via OIDC"
+    required: true
+
+outputs:
+  image-uri:
+    description: "Full ECR image URI (registry/repo:tag)"
+    value: ${{ steps.build-push.outputs.image-uri }}
+  image-digest:
+    description: "Image content digest (sha256)"
+    value: ${{ steps.build-push.outputs.digest }}
+  registry:
+    description: "ECR registry URL"
+    value: ${{ steps.login-ecr.outputs.registry }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure AWS credentials via OIDC
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: GitHubActions-DockerBuild-${{ github.run_id }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      with:
+        registries: ${{ steps.login-ecr.outputs.registry }}
+
+    - name: Set up QEMU (for multi-arch builds)
+      uses: docker/setup-qemu-action@v3
+      if: contains(inputs.platforms, ',') || inputs.platforms != 'linux/amd64'
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: |
+          image=moby/buildkit:latest
+          network=host
+
+    - name: Extract Docker metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix=sha-,format=short
+          type=raw,value=${{ inputs.image-tag }}
+          type=raw,value=latest,enable={{is_default_branch}}
+        labels: |
+          org.opencontainers.image.title=${{ inputs.ecr-repository }}
+          org.opencontainers.image.vendor=ai-agent-soc
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+    - name: Build and push Docker image
+      id: build-push
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        platforms: ${{ inputs.platforms }}
+        push: ${{ inputs.push }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        build-args: ${{ inputs.build-args }}
+        cache-from: |
+          type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:cache-${{ github.ref_name }}
+          type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:cache-main
+        cache-to: |
+          type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:cache-${{ github.ref_name }},mode=max
+        provenance: true
+        sbom: true
+
+    - name: Set image URI output
+      id: set-output
+      shell: bash
+      run: |
+        echo "image-uri=${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ inputs.image-tag }}" >> $GITHUB_OUTPUT
+
+    - name: Run Trivy scan on built image
+      if: inputs.push == 'true'
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: "${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ inputs.image-tag }}"
+        format: "table"
+        exit-code: "1"
+        ignore-unfixed: true
+        vuln-type: "os,library"
+        severity: "CRITICAL,HIGH"

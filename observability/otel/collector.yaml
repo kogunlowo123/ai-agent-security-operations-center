@@ -1,0 +1,102 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: soc-api
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["soc-api:8000"]
+        - job_name: soc-agent-runtime
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["soc-agent-runtime:9090"]
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  resource:
+    attributes:
+      - key: service.namespace
+        value: ai-agent-soc
+        action: insert
+      - key: deployment.environment
+        from_attribute: ENVIRONMENT
+        action: insert
+
+  # PII scrubbing - see pii-scrub-processor.yaml for patterns
+  transform/pii_scrub:
+    trace_statements:
+      - context: span
+        statements:
+          - replace_pattern(attributes["principal_id"], "^usr_[a-z0-9]{8}.*", "usr_REDACTED")
+          - replace_pattern(attributes["payload.email"], ".*@.*", "[REDACTED_EMAIL]")
+    log_statements:
+      - context: log
+        statements:
+          - replace_pattern(body, "(?i)bearer [a-zA-Z0-9._-]+", "Bearer [REDACTED]")
+          - replace_pattern(body, "(?i)api.key[\":=\\s]+[a-zA-Z0-9._-]+", "api_key: [REDACTED]")
+
+  filter/exclude_health:
+    traces:
+      span:
+        - 'attributes["http.route"] == "/health"'
+        - 'attributes["http.route"] == "/readyz"'
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  prometheusremotewrite:
+    endpoint: "http://prometheus:9090/api/v1/write"
+
+  opensearch:
+    http:
+      endpoint: "${OPENSEARCH_URL}"
+      tls:
+        insecure_skip_verify: false
+    dataset: otel-soc
+    namespace: prod
+
+  logging:
+    verbosity: normal
+    sampling_initial: 2
+    sampling_thereafter: 500
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/exclude_health, transform/pii_scrub, batch, resource]
+      exporters: [otlp/tempo]
+
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch, resource]
+      exporters: [prometheusremotewrite]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/pii_scrub, batch, resource]
+      exporters: [opensearch, logging]
+
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      address: 0.0.0.0:8888

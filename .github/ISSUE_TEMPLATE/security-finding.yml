@@ -1,0 +1,220 @@
+name: Security Finding
+description: Report a security vulnerability or finding in the AI Agent SOC (non-critical; for critical findings use private security advisories)
+title: "[Security Finding]: "
+labels:
+  - "security"
+  - "needs-security-review"
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Security Finding Report
+
+        > **IMPORTANT:** If this is a **critical or high-severity vulnerability** (CVSS >= 7.0) that could be exploited in production, please use [GitHub Private Security Advisories](../../security/advisories/new) instead of this public form.
+
+        This form is for medium/low severity findings, security hardening suggestions, and findings from internal security reviews or penetration tests.
+
+  - type: dropdown
+    id: finding-type
+    attributes:
+      label: Finding Type
+      description: What category of security finding is this?
+      options:
+        - Injection (SQL, Command, Prompt, LDAP, etc.)
+        - Broken Authentication / Session Management
+        - Sensitive Data Exposure / Data Leak
+        - Broken Access Control / Privilege Escalation
+        - Security Misconfiguration
+        - Insecure Deserialization
+        - Using Components with Known Vulnerabilities
+        - Insufficient Logging and Monitoring
+        - Agent Prompt Injection
+        - Agent Tool Misuse / Privilege Escalation
+        - Supply Chain / Dependency Vulnerability
+        - Infrastructure / IaC Misconfiguration
+        - Cryptographic Weakness
+        - Denial of Service
+        - Cross-Site Scripting (XSS)
+        - Cross-Site Request Forgery (CSRF)
+        - Server-Side Request Forgery (SSRF)
+        - Hardcoded Secrets / Credentials
+        - Insecure Direct Object Reference (IDOR)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected-component
+    attributes:
+      label: Affected Component
+      description: Which component contains the vulnerability?
+      options:
+        - API Gateway / REST API
+        - Agent Runtime
+        - Threat Detection Agent
+        - Incident Response Agent
+        - Log Analysis Agent
+        - Vulnerability Scanner Agent
+        - Orchestrator / Agent Manager
+        - Web UI / Dashboard
+        - Authentication / Authorization
+        - Data Pipeline / Ingestion
+        - Alert Manager
+        - Infrastructure / Terraform
+        - CI/CD Pipeline
+        - Third-party Dependency
+        - Multiple Components
+        - Unknown
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        ### CVSS v3.1 Score
+        Use the [CVSS Calculator](https://www.first.org/cvss/calculator/3.1) to score this finding.
+
+  - type: input
+    id: cvss-score
+    attributes:
+      label: CVSS v3.1 Base Score
+      description: Numerical score from 0.0 to 10.0
+      placeholder: "e.g., 6.5"
+    validations:
+      required: true
+
+  - type: input
+    id: cvss-vector
+    attributes:
+      label: CVSS v3.1 Vector String
+      description: Full CVSS vector string
+      placeholder: "e.g., CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+
+  - type: dropdown
+    id: cvss-severity
+    attributes:
+      label: CVSS Severity Rating
+      options:
+        - "None (0.0)"
+        - "Low (0.1 – 3.9)"
+        - "Medium (4.0 – 6.9)"
+        - "High (7.0 – 8.9)"
+        - "Critical (9.0 – 10.0)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Vulnerability Description
+      description: |
+        Provide a clear description of the vulnerability.
+        Explain what the vulnerability is and why it is a security risk.
+      placeholder: "Describe the vulnerability..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proof-of-concept
+    attributes:
+      label: Proof of Concept / Reproduction Steps
+      description: |
+        Provide steps to reproduce or a proof-of-concept.
+        **Remove any weaponized exploit code. Describe the impact, not a working attack.**
+      placeholder: |
+        1. Send request to endpoint '...'
+        2. With payload '...'
+        3. The response reveals '...'
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact Assessment
+      description: |
+        What can an attacker do by exploiting this vulnerability?
+        Consider: data confidentiality, integrity, availability, and lateral movement potential.
+      placeholder: |
+        - An unauthenticated attacker can read alert data for all tenants
+        - Attacker can pivot to agent runtime with elevated privileges
+    validations:
+      required: true
+
+  - type: textarea
+    id: affected-versions
+    attributes:
+      label: Affected Versions / Commit Range
+      description: Which versions or commits are affected?
+      placeholder: "e.g., All versions prior to v1.3.0, commit abc123..def456"
+    validations:
+      required: true
+
+  - type: textarea
+    id: remediation
+    attributes:
+      label: Recommended Remediation
+      description: How should this vulnerability be fixed?
+      placeholder: |
+        - Implement input validation on field X before passing to agent
+        - Enforce `Content-Security-Policy` header
+        - Rotate exposed credential and audit access logs
+    validations:
+      required: true
+
+  - type: dropdown
+    id: discovery-method
+    attributes:
+      label: How Was This Discovered?
+      options:
+        - Manual code review
+        - Automated SAST scan (Bandit, Semgrep, CodeQL)
+        - Dependency scan (pip-audit, Trivy, Snyk)
+        - Penetration test
+        - IaC scan (Checkov, tfsec)
+        - Runtime monitoring / anomaly detection
+        - External security researcher
+        - Bug bounty submission
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: cve-cwe
+    attributes:
+      label: CVE / CWE Reference (if applicable)
+      description: Link to existing CVE or relevant CWE ID
+      placeholder: "e.g., CVE-2024-1234 or CWE-89"
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment Where Finding Was Observed
+      description: Production, staging, or dev? Cloud provider and region?
+      placeholder: |
+        - Environment: Staging
+        - Cloud: AWS us-east-1
+        - Version: v1.2.1
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Any additional information, screenshots, or supporting evidence.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Responsible Disclosure Checklist
+      options:
+        - label: I confirm this is NOT a critical/high vulnerability that should be reported via private advisory.
+          required: true
+        - label: I have not included a fully weaponized exploit or working attack code.
+          required: true
+        - label: I have removed any real credentials, tokens, or PII from this report.
+          required: true
+        - label: I understand this issue may be made public after it is remediated.
+          required: true

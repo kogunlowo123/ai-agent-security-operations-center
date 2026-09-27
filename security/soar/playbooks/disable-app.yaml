@@ -1,0 +1,146 @@
+name: disable-app
+version: "1.0"
+description: >
+  Disable a malicious or compromised AI agent application. Scales deployment
+  to zero, removes from service registry, revokes all app credentials, and
+  triggers supply chain integrity verification.
+trigger:
+  event_types:
+    - runtime.guardrail.triggered
+    - supply.chain.anomaly
+    - policy.violation
+  conditions:
+    - field: severity
+      operator: eq
+      value: CRITICAL
+    - field: payload.app_id
+      operator: exists
+
+approval:
+  required: true
+  approvers:
+    - role: incident-commander
+  timeout_minutes: 5
+  escalation_on_timeout:
+    - role: ciso
+    - role: cto
+
+steps:
+  - id: validate_app
+    name: Validate Application Identity
+    type: api_call
+    config:
+      method: GET
+      url: "https://soc-api.internal/api/v1/identity/agents/{payload.app_id}"
+      headers:
+        Authorization: "Bearer {secrets.soc_service_token}"
+    on_failure:
+      action: abort
+      message: "Cannot validate app identity. Aborting to prevent disabling wrong application."
+
+  - id: scale_to_zero
+    name: Scale Deployment to Zero Replicas
+    type: kubernetes_action
+    config:
+      action: scale_deployment
+      parameters:
+        namespace: "{steps.validate_app.namespace}"
+        deployment_name: "{steps.validate_app.deployment_name}"
+        replicas: 0
+    rollback:
+      action: scale_deployment
+      parameters:
+        namespace: "{steps.validate_app.namespace}"
+        deployment_name: "{steps.validate_app.deployment_name}"
+        replicas: "{steps.validate_app.current_replicas}"
+
+  - id: deregister_from_registry
+    name: Deregister Agent from Identity Registry
+    type: api_call
+    config:
+      method: PATCH
+      url: "https://soc-api.internal/api/v1/identity/agents/{payload.app_id}"
+      headers:
+        Authorization: "Bearer {secrets.soc_service_token}"
+        Content-Type: application/json
+      body:
+        status: SUSPENDED
+        suspended_reason: "soc-automated-disable"
+        incident_id: "{incident_id}"
+        suspended_at: "{timestamp}"
+
+  - id: revoke_app_credentials
+    name: Revoke All Application Credentials
+    type: aws_action
+    config:
+      action: secretsmanager.delete_secret
+      parameters:
+        secret_id: "{payload.app_id}/credentials"
+        recovery_window_in_days: 30
+    condition: "steps.validate_app.has_secrets == true"
+
+  - id: block_bedrock_access
+    name: Remove Bedrock Model Access
+    type: aws_action
+    config:
+      action: iam.put_role_policy
+      parameters:
+        role_name: "{steps.validate_app.iam_role}"
+        policy_name: "soc-deny-bedrock-{incident_id}"
+        policy_document:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Deny
+              Action:
+                - "bedrock:InvokeModel"
+                - "bedrock:InvokeModelWithResponseStream"
+              Resource: "*"
+
+  - id: trigger_supply_chain_scan
+    name: Trigger Supply Chain Integrity Scan
+    type: api_call
+    config:
+      method: POST
+      url: "https://soc-api.internal/api/v1/scans/supply-chain"
+      headers:
+        Authorization: "Bearer {secrets.soc_service_token}"
+        Content-Type: application/json
+      body:
+        app_id: "{payload.app_id}"
+        image_digest: "{steps.validate_app.image_digest}"
+        trigger: "soc-incident"
+        incident_id: "{incident_id}"
+
+  - id: notify_app_team
+    name: Notify Application Owner Team
+    type: notification
+    config:
+      channels:
+        - slack:
+            channel: "#soc-critical"
+            message: |
+              :no_entry: *Application Disabled by SOC*
+              App ID: {payload.app_id}
+              Incident: {incident_id}
+              Reason: {payload.trigger_reason}
+              MITRE Technique: {payload.mitre_technique}
+              Replicas: scaled to 0
+              Registry status: SUSPENDED
+              Time: {timestamp}
+
+              *Owner team*: {steps.validate_app.owner_team}
+              *Next steps*: Contact SOC before re-enabling. Supply chain scan in progress.
+        - pagerduty:
+            service_key: "{secrets.pagerduty_appteam_key}"
+            severity: critical
+            summary: "App {payload.app_id} disabled by SOC - incident {incident_id}"
+        - email:
+            to: "{steps.validate_app.owner_email}"
+            subject: "Your AI agent application has been disabled by Security Operations"
+            template: app_disable_owner_notice
+
+outputs:
+  - app_status: "SUSPENDED"
+  - deployment_replicas: 0
+  - supply_chain_scan_id: "{steps.trigger_supply_chain_scan.scan_id}"
+  - disabled_at: "{timestamp}"
