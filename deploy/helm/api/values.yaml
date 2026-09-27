@@ -1,38 +1,20 @@
-# Default values for soc-api Helm chart.
-# Override in values-production.yaml or via --set flags.
+# Default values for the soc-api Helm chart.
+# Override these values in deploy/helm/umbrella/values.yaml or via --set flags.
 
 # ---------------------------------------------------------------------------
-# Global settings (shared with umbrella chart)
-# ---------------------------------------------------------------------------
-global:
-  imageRegistry: ""
-  imagePullSecrets: []
-  storageClass: ""
-  tenantId: ""
-
-# ---------------------------------------------------------------------------
-# Image
-# ---------------------------------------------------------------------------
-image:
-  registry: ghcr.io
-  repository: acme-corp/ai-agent-security-operations-center/soc-api
-  tag: "latest"
-  pullPolicy: IfNotPresent
-  pullSecrets: []
-
-# ---------------------------------------------------------------------------
-# Deployment
+# Replica and deployment configuration
 # ---------------------------------------------------------------------------
 replicaCount: 2
 
-strategy:
-  type: RollingUpdate
-  rollingUpdate:
-    maxSurge: 1
-    maxUnavailable: 0
+image:
+  repository: ghcr.io/acme-corp/soc-api
+  tag: ""  # Defaults to chart appVersion if empty
+  pullPolicy: IfNotPresent
+  pullSecrets:
+    - name: ghcr-pull-secret
 
 # ---------------------------------------------------------------------------
-# Service
+# Service configuration
 # ---------------------------------------------------------------------------
 service:
   type: ClusterIP
@@ -42,31 +24,29 @@ service:
   annotations: {}
 
 # ---------------------------------------------------------------------------
-# Ingress
+# Ingress configuration
 # ---------------------------------------------------------------------------
 ingress:
   enabled: true
-  className: "nginx"
+  className: nginx
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/proxy-body-size: "4m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
-    nginx.ingress.kubernetes.io/rate-limit: "100"
-    nginx.ingress.kubernetes.io/rate-limit-burst-multiplier: "5"
-    cert-manager.io/cluster-issuer: "letsencrypt-production"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
   hosts:
-    - host: api.soc.acme-corp.com
+    - host: soc-api.example.com
       paths:
-        - path: /api/v1
+        - path: /
           pathType: Prefix
   tls:
     - secretName: soc-api-tls
       hosts:
-        - api.soc.acme-corp.com
+        - soc-api.example.com
 
 # ---------------------------------------------------------------------------
-# Resources
+# Resource requests and limits
 # ---------------------------------------------------------------------------
 resources:
   requests:
@@ -83,19 +63,8 @@ autoscaling:
   enabled: true
   minReplicas: 2
   maxReplicas: 10
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 80
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 300
@@ -104,11 +73,11 @@ autoscaling:
           value: 1
           periodSeconds: 60
     scaleUp:
-      stabilizationWindowSeconds: 60
+      stabilizationWindowSeconds: 30
       policies:
         - type: Pods
           value: 2
-          periodSeconds: 30
+          periodSeconds: 60
 
 # ---------------------------------------------------------------------------
 # Pod Disruption Budget
@@ -118,78 +87,95 @@ podDisruptionBudget:
   minAvailable: 1
 
 # ---------------------------------------------------------------------------
-# Service Account
-# ---------------------------------------------------------------------------
-serviceAccount:
-  create: false
-  name: "soc-api"
-  annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/soc-api-irsa-role"
-
-# ---------------------------------------------------------------------------
 # Environment variables
 # ---------------------------------------------------------------------------
 env:
-  - name: APP_ENV
-    value: "production"
-  - name: LOG_LEVEL
-    value: "INFO"
-  - name: WORKERS
-    value: "4"
-  - name: PORT
-    value: "8080"
-  - name: OTEL_SERVICE_NAME
-    value: "soc-api"
-  - name: OTEL_EXPORTER_OTLP_ENDPOINT
-    value: "http://soc-otel-collector.soc-observability.svc.cluster.local:4317"
-  - name: OTEL_TRACES_SAMPLER
-    value: "parentbased_traceidratio"
-  - name: OTEL_TRACES_SAMPLER_ARG
-    value: "0.1"
+  # Application settings
+  LOG_LEVEL: "INFO"
+  APP_ENV: "production"
+  APP_PORT: "8080"
+  WORKERS: "4"
 
-# Secrets mounted from ExternalSecret
-envFrom:
-  - secretRef:
-      name: soc-api-secrets
+  # AWS region
+  AWS_DEFAULT_REGION: "us-east-1"
+
+  # Feature flags
+  ENABLE_MITRE_ENRICHMENT: "true"
+  ENABLE_POSTURE_SCORING: "true"
+  ENABLE_THREAT_HUNTING: "true"
+
+# Secrets sourced from Kubernetes secrets (created by External Secrets Operator)
+envFromSecrets:
+  - secretName: soc-api-secrets
+    keys:
+      - DATABASE_URL
+      - JWT_SECRET
+      - OPENSEARCH_PASSWORD
+      - SQS_BASE_URL
+      - BEDROCK_MODEL_ID
 
 # ---------------------------------------------------------------------------
-# Probes
+# ConfigMap-based configuration
+# ---------------------------------------------------------------------------
+config:
+  opensearch:
+    host: "opensearch.soc-platform.svc.cluster.local"
+    port: 9200
+    use_ssl: true
+    verify_certs: true
+    mitre_index: "mitre-attck-v14"
+    events_index_pattern: "soc-events-*"
+  sqs:
+    region: "us-east-1"
+    ingest_queue_name: "soc-ingest"
+    hunt_queue_name: "soc-hunt"
+    visibility_timeout: 120
+    max_number_of_messages: 10
+  jwt:
+    algorithm: "RS256"
+    audience: "ai-agent-soc-api"
+    issuer: "ai-agent-soc"
+    expiry_seconds: 3600
+  posture:
+    refresh_interval_seconds: 3600
+    score_window_hours: 24
+
+# ---------------------------------------------------------------------------
+# Health checks
 # ---------------------------------------------------------------------------
 livenessProbe:
   httpGet:
-    path: /health
+    path: /api/v1/health
     port: 8080
   initialDelaySeconds: 30
-  periodSeconds: 10
+  periodSeconds: 15
   timeoutSeconds: 5
   failureThreshold: 3
 
 readinessProbe:
   httpGet:
-    path: /ready
+    path: /api/v1/readiness
     port: 8080
   initialDelaySeconds: 10
-  periodSeconds: 5
-  timeoutSeconds: 3
+  periodSeconds: 10
+  timeoutSeconds: 5
   failureThreshold: 3
-  successThreshold: 1
 
 startupProbe:
   httpGet:
-    path: /health
+    path: /api/v1/health
     port: 8080
-  initialDelaySeconds: 10
+  initialDelaySeconds: 5
   periodSeconds: 5
   timeoutSeconds: 3
-  failureThreshold: 30
+  failureThreshold: 30  # 5s * 30 = 150s max startup time
 
 # ---------------------------------------------------------------------------
-# Security Context
+# Security context
 # ---------------------------------------------------------------------------
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
-  runAsGroup: 1000
   fsGroup: 1000
   seccompProfile:
     type: RuntimeDefault
@@ -197,24 +183,23 @@ podSecurityContext:
 containerSecurityContext:
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
   capabilities:
     drop:
       - ALL
 
 # ---------------------------------------------------------------------------
-# Pod annotations & labels
+# Service account
 # ---------------------------------------------------------------------------
-podAnnotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/port: "8080"
-  prometheus.io/path: "/metrics"
-
-podLabels:
-  app.kubernetes.io/component: api
-  app.kubernetes.io/part-of: ai-agent-soc
+serviceAccount:
+  create: true
+  name: "soc-api"
+  annotations:
+    eks.amazonaws.com/role-arn: ""  # Set to IAM role ARN for IRSA
 
 # ---------------------------------------------------------------------------
-# Node selector, tolerations, affinity
+# Node scheduling
 # ---------------------------------------------------------------------------
 nodeSelector: {}
 
@@ -226,53 +211,37 @@ affinity:
       - weight: 100
         podAffinityTerm:
           labelSelector:
-            matchExpressions:
-              - key: app.kubernetes.io/name
-                operator: In
-                values:
-                  - soc-api
+            matchLabels:
+              app.kubernetes.io/name: soc-api
           topologyKey: kubernetes.io/hostname
 
 # ---------------------------------------------------------------------------
-# Volume mounts (temp dir for read-only root filesystem)
+# Volumes (for read-only root filesystem)
 # ---------------------------------------------------------------------------
 volumes:
   - name: tmp
+    emptyDir: {}
+  - name: logs
     emptyDir: {}
 
 volumeMounts:
   - name: tmp
     mountPath: /tmp
+  - name: logs
+    mountPath: /app/logs
 
 # ---------------------------------------------------------------------------
-# Network Policy
+# Pod annotations
 # ---------------------------------------------------------------------------
-networkPolicy:
-  enabled: true
-  # Allow ingress only from ingress controller and other soc-platform pods
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: ingress-nginx
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/part-of: ai-agent-soc
-  # Allow egress to required backends
-  egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: soc-observability
-      ports:
-        - port: 4317  # OTLP gRPC
-    - to: []
-      ports:
-        - port: 443   # AWS APIs (SQS, OpenSearch, Secrets Manager)
-        - port: 5432  # PostgreSQL
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+  sidecar.istio.io/inject: "true"
 
 # ---------------------------------------------------------------------------
-# Common (bitnami/common) — set false to disable
+# Extra labels
 # ---------------------------------------------------------------------------
-common:
-  enabled: false
+commonLabels:
+  app.kubernetes.io/part-of: ai-agent-soc
+  app.kubernetes.io/managed-by: helm

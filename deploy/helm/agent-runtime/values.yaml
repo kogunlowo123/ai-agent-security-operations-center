@@ -1,146 +1,64 @@
-# Default values for soc-agent-runtime Helm chart.
+# Default values for the soc-agent-runtime Helm chart.
+# The agent-runtime service processes events from SQS, performs AI-assisted
+# triage using Bedrock/Claude, and creates incidents in PostgreSQL.
 
 # ---------------------------------------------------------------------------
-# Global
-# ---------------------------------------------------------------------------
-global:
-  imageRegistry: ""
-  imagePullSecrets: []
-  storageClass: ""
-
-# ---------------------------------------------------------------------------
-# Image
-# ---------------------------------------------------------------------------
-image:
-  registry: ghcr.io
-  repository: acme-corp/ai-agent-security-operations-center/soc-agent-runtime
-  tag: "latest"
-  pullPolicy: IfNotPresent
-  pullSecrets: []
-
-# ---------------------------------------------------------------------------
-# Deployment
+# Replica and deployment configuration
 # ---------------------------------------------------------------------------
 replicaCount: 2
 
-strategy:
-  type: RollingUpdate
-  rollingUpdate:
-    maxSurge: 1
-    maxUnavailable: 0
+image:
+  repository: ghcr.io/acme-corp/soc-agent-runtime
+  tag: ""  # Defaults to chart appVersion if empty
+  pullPolicy: IfNotPresent
+  pullSecrets:
+    - name: ghcr-pull-secret
 
 # ---------------------------------------------------------------------------
-# Service (internal — no ingress, consumed via SQS + API)
+# Service configuration
 # ---------------------------------------------------------------------------
 service:
   type: ClusterIP
-  port: 9090
-  targetPort: 9090
+  port: 8081
+  targetPort: 8081
   protocol: TCP
   annotations: {}
 
 # ---------------------------------------------------------------------------
-# Agent configuration
-# ---------------------------------------------------------------------------
-agents:
-  # Triage agent — classifies events and maps to ATT&CK
-  triage:
-    enabled: true
-    replicas: 2
-    model: "claude-sonnet-4-6"
-    maxConcurrentJobs: 10
-    timeoutSeconds: 30
-    resources:
-      requests:
-        cpu: "500m"
-        memory: "512Mi"
-      limits:
-        cpu: "2000m"
-        memory: "2Gi"
-
-  # Threat hunt agent — generates and executes hunt hypotheses
-  threatHunt:
-    enabled: true
-    replicas: 1
-    model: "claude-opus-4-5"
-    maxConcurrentJobs: 5
-    timeoutSeconds: 120
-    resources:
-      requests:
-        cpu: "500m"
-        memory: "1Gi"
-      limits:
-        cpu: "2000m"
-        memory: "4Gi"
-
-  # Posture agent — computes posture scores and generates recommendations
-  posture:
-    enabled: true
-    replicas: 1
-    model: "claude-haiku-4-5"
-    scheduleIntervalMinutes: 15
-    resources:
-      requests:
-        cpu: "250m"
-        memory: "256Mi"
-      limits:
-        cpu: "1000m"
-        memory: "1Gi"
-
-# ---------------------------------------------------------------------------
-# RAG / Retrieval configuration
-# ---------------------------------------------------------------------------
-rag:
-  opensearch:
-    indexName: "mitre-attck-v15"
-    knnAlgorithm: "hnsw"
-    knnEf: 512
-    knnM: 48
-    topK: 20
-    rerankerTopK: 5
-  embeddingModel: "text-embedding-3-large"
-  chunkSize: 400
-  chunkOverlap: 50
-
-# ---------------------------------------------------------------------------
-# SQS configuration
-# ---------------------------------------------------------------------------
-sqs:
-  triageQueueUrl: ""      # Overridden by ExternalSecret
-  huntQueueUrl: ""        # Overridden by ExternalSecret
-  visibilityTimeoutSeconds: 300
-  maxMessages: 10
-  waitTimeSeconds: 20
-
-# ---------------------------------------------------------------------------
-# Resources (default — overridden per agent above)
+# Resource requests and limits
 # ---------------------------------------------------------------------------
 resources:
   requests:
-    cpu: "250m"
-    memory: "256Mi"
+    cpu: "500m"
+    memory: "512Mi"
   limits:
-    cpu: "1000m"
-    memory: "1Gi"
+    cpu: "2000m"
+    memory: "2Gi"
 
 # ---------------------------------------------------------------------------
-# Autoscaling (for triage workers)
+# Autoscaling
 # ---------------------------------------------------------------------------
 autoscaling:
   enabled: true
   minReplicas: 2
   maxReplicas: 20
-  # Scale based on SQS queue depth (custom metric via KEDA)
-  keda:
-    enabled: true
-    scaledObjectSpec:
-      triggers:
-        - type: aws-sqs-queue
-          metadata:
-            queueURL: ""  # Set via ExternalSecret
-            queueLength: "5"
-            awsRegion: "us-east-1"
-            identityOwner: pod
+  # Scale on SQS queue depth (preferred) or CPU/memory fallback
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 75
+  # External metrics for SQS-based scaling (requires KEDA or custom metrics adapter)
+  externalMetrics:
+    enabled: false
+    sqsQueueName: "soc-ingest"
+    targetQueueDepth: 100
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60
 
 # ---------------------------------------------------------------------------
 # Pod Disruption Budget
@@ -150,44 +68,62 @@ podDisruptionBudget:
   minAvailable: 1
 
 # ---------------------------------------------------------------------------
-# Service Account
-# ---------------------------------------------------------------------------
-serviceAccount:
-  create: false
-  name: "soc-agent-runtime"
-  annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/soc-agent-runtime-irsa-role"
-
-# ---------------------------------------------------------------------------
 # Environment variables
 # ---------------------------------------------------------------------------
 env:
-  - name: APP_ENV
-    value: "production"
-  - name: LOG_LEVEL
-    value: "INFO"
-  - name: OTEL_SERVICE_NAME
-    value: "soc-agent-runtime"
-  - name: OTEL_EXPORTER_OTLP_ENDPOINT
-    value: "http://soc-otel-collector.soc-observability.svc.cluster.local:4317"
-  - name: ANTHROPIC_MAX_RETRIES
-    value: "3"
-  - name: ANTHROPIC_TIMEOUT_SECS
-    value: "60"
-  - name: ANTHROPIC_DEFAULT_MODEL
-    value: "claude-sonnet-4-6"
+  LOG_LEVEL: "INFO"
+  APP_ENV: "production"
+  AWS_DEFAULT_REGION: "us-east-1"
 
-envFrom:
-  - secretRef:
-      name: soc-agent-secrets
+  # SQS consumer configuration
+  SQS_VISIBILITY_TIMEOUT: "120"
+  SQS_MAX_MESSAGES: "10"
+  SQS_WAIT_TIME_SECONDS: "20"
+  SQS_MAX_CONCURRENT_WORKERS: "20"
+
+  # AI model configuration
+  BEDROCK_REGION: "us-east-1"
+  TRIAGE_MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0"
+  ENRICHMENT_MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0"
+  HUNT_MODEL_ID: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+  # Model inference settings
+  TRIAGE_MAX_TOKENS: "1024"
+  TRIAGE_TEMPERATURE: "0.0"
+  ENRICHMENT_MAX_TOKENS: "512"
+
+  # RAG configuration
+  MITRE_INDEX: "mitre-attck-v14"
+  RAG_TOP_K: "5"
+  RAG_SIMILARITY_THRESHOLD: "0.75"
+
+  # Incident creation thresholds
+  AUTO_CREATE_INCIDENT_SEVERITY: "HIGH,CRITICAL"
+  AUTO_CREATE_INCIDENT_CONFIDENCE: "0.85"
+
+  # Feature flags
+  ENABLE_MITRE_ENRICHMENT: "true"
+  ENABLE_AUTO_INCIDENT_CREATION: "true"
+  ENABLE_CROSS_EVENT_CORRELATION: "true"
+
+# Secrets sourced from Kubernetes secrets (created by External Secrets Operator)
+envFromSecrets:
+  - secretName: soc-agent-runtime-secrets
+    keys:
+      - DATABASE_URL
+      - OPENSEARCH_PASSWORD
+      - SQS_BASE_URL
+      - SQS_HUNT_QUEUE_URL
+      - BEDROCK_ACCESS_KEY_ID
+      - BEDROCK_SECRET_ACCESS_KEY
 
 # ---------------------------------------------------------------------------
-# Probes
+# Health checks
 # ---------------------------------------------------------------------------
 livenessProbe:
   httpGet:
     path: /health
-    port: 9090
+    port: 8081
   initialDelaySeconds: 30
   periodSeconds: 15
   timeoutSeconds: 5
@@ -195,20 +131,28 @@ livenessProbe:
 
 readinessProbe:
   httpGet:
-    path: /ready
-    port: 9090
+    path: /readiness
+    port: 8081
   initialDelaySeconds: 15
   periodSeconds: 10
   timeoutSeconds: 5
   failureThreshold: 3
 
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8081
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 40  # 5s * 40 = 200s max startup
+
 # ---------------------------------------------------------------------------
-# Security Context
+# Security context
 # ---------------------------------------------------------------------------
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
-  runAsGroup: 1000
   fsGroup: 1000
   seccompProfile:
     type: RuntimeDefault
@@ -216,28 +160,25 @@ podSecurityContext:
 containerSecurityContext:
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
   capabilities:
     drop:
       - ALL
 
 # ---------------------------------------------------------------------------
-# Pod annotations & labels
+# Service account with IRSA for AWS Bedrock and SQS
 # ---------------------------------------------------------------------------
-podAnnotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/port: "9090"
-  prometheus.io/path: "/metrics"
-
-podLabels:
-  app.kubernetes.io/component: agent-runtime
-  app.kubernetes.io/part-of: ai-agent-soc
+serviceAccount:
+  create: true
+  name: "soc-agent-runtime"
+  annotations:
+    eks.amazonaws.com/role-arn: ""  # Set to IAM role ARN with Bedrock + SQS permissions
 
 # ---------------------------------------------------------------------------
-# Node selector, tolerations, affinity
+# Node scheduling
 # ---------------------------------------------------------------------------
-nodeSelector:
-  # Prefer compute-optimised nodes for LLM inference
-  node.kubernetes.io/instance-type: "c6i.xlarge"
+nodeSelector: {}
 
 tolerations: []
 
@@ -247,11 +188,8 @@ affinity:
       - weight: 100
         podAffinityTerm:
           labelSelector:
-            matchExpressions:
-              - key: app.kubernetes.io/name
-                operator: In
-                values:
-                  - soc-agent-runtime
+            matchLabels:
+              app.kubernetes.io/name: soc-agent-runtime
           topologyKey: kubernetes.io/hostname
 
 # ---------------------------------------------------------------------------
@@ -260,32 +198,29 @@ affinity:
 volumes:
   - name: tmp
     emptyDir: {}
-  - name: agent-cache
+  - name: model-cache
     emptyDir:
-      sizeLimit: "2Gi"
+      sizeLimit: "1Gi"
 
 volumeMounts:
   - name: tmp
     mountPath: /tmp
-  - name: agent-cache
-    mountPath: /var/cache/soc-agents
+  - name: model-cache
+    mountPath: /app/.cache
 
 # ---------------------------------------------------------------------------
-# Network Policy
+# Pod annotations
 # ---------------------------------------------------------------------------
-networkPolicy:
-  enabled: true
-  egress:
-    - to: []
-      ports:
-        - port: 443   # Anthropic API + AWS APIs
-        - port: 9200  # OpenSearch
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: soc-observability
-      ports:
-        - port: 4317  # OTLP
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8081"
+  prometheus.io/path: "/metrics"
+  sidecar.istio.io/inject: "true"
 
-common:
-  enabled: false
+# ---------------------------------------------------------------------------
+# Extra labels
+# ---------------------------------------------------------------------------
+commonLabels:
+  app.kubernetes.io/part-of: ai-agent-soc
+  app.kubernetes.io/managed-by: helm
+  app.kubernetes.io/component: agent-runtime

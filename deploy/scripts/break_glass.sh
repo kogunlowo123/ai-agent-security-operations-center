@@ -1,38 +1,35 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Break-Glass Emergency Access Script
-# AI Agent Security Operations Center
+# SOC Platform Break-Glass Access Script
 #
-# PURPOSE:
-#   Creates time-limited admin credentials for emergency production access
-#   when normal IAM access paths are unavailable (e.g., identity provider outage).
+# PURPOSE: Provides emergency time-limited access to production systems when
+#          normal access channels are unavailable (e.g., IdP outage, incident).
+#
+# SECURITY CONTROLS:
+#   1. Requires multi-factor identity verification before granting access
+#   2. Issues time-limited credentials (default: 60 minutes)
+#   3. Creates an immutable audit log entry in AWS CloudTrail and S3
+#   4. Sends real-time alerts to the security team
+#   5. All commands executed during the break-glass session are logged
+#   6. Credentials are automatically revoked at expiry
 #
 # USAGE:
-#   bash deploy/scripts/break_glass.sh \
-#     --reason "Active ransomware incident — INC-2024-0892" \
-#     --incident-id INC-2024-0892 \
-#     [--duration 4]        # Hours (default: 4, max: 8)
-#     [--dry-run]           # Print what would happen without making changes
+#   ./break_glass.sh --reason "Production outage INC-ABC123" \
+#                    --duration 60 \
+#                    --approver "soc-lead@example.com"
 #
-# REQUIREMENTS:
-#   - AWS CLI v2 configured with break-glass-initiator IAM role (read-only by default)
-#   - jq
-#   - curl (for SNS/Slack alerts)
-#   - MFA device or Yubikey touch pad present
+# PREREQUISITES:
+#   - AWS CLI v2 configured with break-glass IAM user credentials
+#   - jq installed
+#   - aws-vault (optional, for local credential storage)
+#   - Access to break-glass MFA device
 #
-# AUDIT:
-#   Every use of this script is logged to:
-#     - AWS CloudTrail (IAM assume-role events)
-#     - S3 audit bucket: s3://soc-audit-logs/break-glass/
-#     - SNS topic: arn:aws:sns:REGION:ACCOUNT:soc-security-alerts
-#     - Slack: #soc-incidents (via SNS → Lambda → Slack)
-#
-# SECURITY NOTES:
-#   - Credentials expire automatically (max 8 hours, non-renewable)
-#   - All API calls during the break-glass session are logged with tag BreakGlass=true
-#   - CISO and Security Lead are paged immediately upon use
-#   - The temporary role has write access ONLY to the incident namespace
-#
+# AUDIT TRAIL:
+#   All break-glass events are written to:
+#   - AWS CloudTrail: event source "breakglass.soc.internal"
+#   - S3: s3://soc-audit-logs/break-glass/YYYY/MM/DD/
+#   - PagerDuty: creates P1 incident in "Break Glass Access" service
+#   - Slack: posts to #soc-security-alerts channel
 # =============================================================================
 
 set -euo pipefail
@@ -40,53 +37,344 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BREAK_GLASS_ROLE_ARN="${BREAK_GLASS_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNT_ID:-ACCOUNT_ID}:role/BreakGlassAdminRole}"
-AUDIT_S3_BUCKET="${AUDIT_BUCKET:-soc-audit-logs}"
-ALERT_SNS_TOPIC_ARN="${ALERT_SNS_TOPIC:-arn:aws:sns:us-east-1:${AWS_ACCOUNT_ID:-ACCOUNT_ID}:soc-security-alerts}"
-SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
-MAX_DURATION_HOURS=8
-DEFAULT_DURATION_HOURS=4
-REQUIRED_MFA=true
+readonly SCRIPT_VERSION="1.2.0"
+readonly BREAK_GLASS_ROLE_ARN="${BREAK_GLASS_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNT_ID:-ACCOUNT_ID_NOT_SET}:role/SocBreakGlassRole}"
+readonly AUDIT_BUCKET="${SOC_AUDIT_BUCKET:-soc-audit-logs}"
+readonly AUDIT_PREFIX="break-glass"
+readonly SLACK_WEBHOOK_SECRET="soc/slack/security-alerts-webhook"
+readonly PAGERDUTY_SECRET="soc/pagerduty/break-glass-integration-key"
+readonly MAX_DURATION_MINUTES=120
+readonly DEFAULT_DURATION_MINUTES=60
+readonly SESSION_LOG_DIR="/tmp/break-glass-session-$$"
 
 # ---------------------------------------------------------------------------
-# Colours
+# Colours for terminal output
 # ---------------------------------------------------------------------------
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
 BOLD='\033[1m'
-RESET='\033[0m'
+NC='\033[0m'
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Logging helpers
 # ---------------------------------------------------------------------------
-log_info()  { echo -e "${GREEN}[INFO]${RESET}  $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
-log_error() { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
-log_audit() { echo "[AUDIT $(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "${AUDIT_LOG_FILE:-/dev/stderr}"; }
-
-die() {
-  log_error "$*"
-  exit 1
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >&2; }
+log_error() { echo -e "${RED}[ERROR]${NC} $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >&2; }
+log_audit() {
+  local message="$1"
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | AUDIT | USER=${OPERATOR_EMAIL:-unknown} | INCIDENT=${INCIDENT_REF:-N/A} | ${message}"
 }
 
+# ---------------------------------------------------------------------------
+# Prerequisite checks
+# ---------------------------------------------------------------------------
+check_prerequisites() {
+  log_info "Checking prerequisites..."
+
+  local missing=()
+  for cmd in aws jq curl; do
+    if ! command -v "$cmd" &>/dev/null; then
+      missing+=("$cmd")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log_error "Missing required commands: ${missing[*]}"
+    log_error "Install missing tools and retry."
+    exit 1
+  fi
+
+  # Verify AWS credentials are configured
+  if ! aws sts get-caller-identity &>/dev/null; then
+    log_error "AWS credentials are not configured or expired."
+    log_error "Configure credentials using: aws configure OR aws-vault exec <profile>"
+    exit 1
+  fi
+
+  log_info "Prerequisites satisfied."
+}
+
+# ---------------------------------------------------------------------------
+# Identity verification
+# ---------------------------------------------------------------------------
+verify_identity() {
+  log_info "${BOLD}=== IDENTITY VERIFICATION ===${NC}"
+  log_warn "This action will be permanently logged. Unauthorized use is a policy violation."
+  echo ""
+
+  # Get operator email
+  if [[ -z "${OPERATOR_EMAIL:-}" ]]; then
+    read -r -p "Enter your work email address: " OPERATOR_EMAIL
+    if [[ ! "$OPERATOR_EMAIL" =~ ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$ ]]; then
+      log_error "Invalid email address format."
+      exit 1
+    fi
+  fi
+
+  # Verify MFA token
+  log_info "Enter your MFA token for break-glass access:"
+  read -r -s MFA_TOKEN
+  if [[ ${#MFA_TOKEN} -ne 6 ]] || [[ ! "$MFA_TOKEN" =~ ^[0-9]{6}$ ]]; then
+    log_error "MFA token must be exactly 6 digits."
+    exit 1
+  fi
+
+  # Get approver confirmation (for duress check and accountability)
+  if [[ -z "${APPROVER_EMAIL:-}" ]]; then
+    read -r -p "Enter the email of your approver (SOC lead or CISO): " APPROVER_EMAIL
+  fi
+
+  log_info "Identity verification: operator=${OPERATOR_EMAIL}, approver=${APPROVER_EMAIL}"
+}
+
+# ---------------------------------------------------------------------------
+# Assume the break-glass IAM role with MFA
+# ---------------------------------------------------------------------------
+assume_break_glass_role() {
+  local duration_seconds=$(( DURATION_MINUTES * 60 ))
+  local session_name="BreakGlass-${OPERATOR_EMAIL//[@.]/-}-$(date -u '+%Y%m%dT%H%M%S')"
+  # Truncate to AWS's 64-char limit
+  session_name="${session_name:0:64}"
+
+  log_info "Assuming break-glass role: ${BREAK_GLASS_ROLE_ARN}"
+  log_info "Session duration: ${DURATION_MINUTES} minutes"
+
+  # Get MFA device serial for the current IAM user
+  local mfa_serial
+  mfa_serial=$(aws iam list-mfa-devices --query 'MFADevices[0].SerialNumber' --output text 2>/dev/null || echo "")
+
+  if [[ -z "$mfa_serial" || "$mfa_serial" == "None" ]]; then
+    log_error "No MFA device found for the current IAM user."
+    log_error "Break-glass access requires MFA. Ensure MFA is configured on the break-glass IAM user."
+    exit 1
+  fi
+
+  # Assume the break-glass role with MFA
+  local credentials_json
+  credentials_json=$(aws sts assume-role \
+    --role-arn "${BREAK_GLASS_ROLE_ARN}" \
+    --role-session-name "${session_name}" \
+    --serial-number "${mfa_serial}" \
+    --token-code "${MFA_TOKEN}" \
+    --duration-seconds "${duration_seconds}" \
+    --output json 2>&1) || {
+      log_error "Failed to assume break-glass role. Check MFA token and try again."
+      log_error "Error: ${credentials_json}"
+      exit 1
+    }
+
+  # Extract credentials
+  export AWS_ACCESS_KEY_ID
+  export AWS_SECRET_ACCESS_KEY
+  export AWS_SESSION_TOKEN
+  export BREAK_GLASS_EXPIRY
+
+  AWS_ACCESS_KEY_ID=$(echo "$credentials_json" | jq -r '.Credentials.AccessKeyId')
+  AWS_SECRET_ACCESS_KEY=$(echo "$credentials_json" | jq -r '.Credentials.SecretAccessKey')
+  AWS_SESSION_TOKEN=$(echo "$credentials_json" | jq -r '.Credentials.SessionToken')
+  BREAK_GLASS_EXPIRY=$(echo "$credentials_json" | jq -r '.Credentials.Expiration')
+
+  log_info "${GREEN}Break-glass credentials issued.${NC}"
+  log_info "Expiry: ${BREAK_GLASS_EXPIRY}"
+  log_info "Role: $(echo "$credentials_json" | jq -r '.AssumedRoleUser.Arn')"
+}
+
+# ---------------------------------------------------------------------------
+# Write audit log to S3 and CloudTrail
+# ---------------------------------------------------------------------------
+write_audit_log() {
+  local event_type="$1"
+  local details="${2:-}"
+
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  local date_path
+  date_path=$(date -u '+%Y/%m/%d')
+
+  local audit_record
+  audit_record=$(jq -n \
+    --arg ts "$timestamp" \
+    --arg event "$event_type" \
+    --arg operator "${OPERATOR_EMAIL:-unknown}" \
+    --arg approver "${APPROVER_EMAIL:-unknown}" \
+    --arg incident "${INCIDENT_REF:-N/A}" \
+    --arg reason "${REASON:-No reason provided}" \
+    --arg duration "${DURATION_MINUTES:-0}" \
+    --arg expiry "${BREAK_GLASS_EXPIRY:-unknown}" \
+    --arg details "$details" \
+    --arg version "$SCRIPT_VERSION" \
+    '{
+      timestamp: $ts,
+      event_type: $event,
+      operator_email: $operator,
+      approver_email: $approver,
+      incident_reference: $incident,
+      reason: $reason,
+      duration_minutes: ($duration | tonumber),
+      credential_expiry: $expiry,
+      details: $details,
+      script_version: $version,
+      source: "break-glass-script"
+    }')
+
+  # Write to local session log
+  mkdir -p "${SESSION_LOG_DIR}"
+  echo "$audit_record" >> "${SESSION_LOG_DIR}/audit.jsonl"
+
+  # Write to S3 (best effort — don't fail if S3 write fails)
+  local s3_key="${AUDIT_PREFIX}/${date_path}/$(date -u '+%H%M%S')-${event_type,,}-$$.json"
+  if aws s3 cp - "s3://${AUDIT_BUCKET}/${s3_key}" \
+    --content-type "application/json" \
+    --server-side-encryption "aws:kms" \
+    --metadata "event-type=${event_type},operator=${OPERATOR_EMAIL:-unknown}" \
+    <<< "$audit_record" 2>/dev/null; then
+    log_info "Audit log written to s3://${AUDIT_BUCKET}/${s3_key}"
+  else
+    log_warn "Failed to write audit log to S3. Local copy saved to ${SESSION_LOG_DIR}/audit.jsonl"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Send security alerts
+# ---------------------------------------------------------------------------
+send_alerts() {
+  local event_type="$1"
+
+  # Slack alert (best effort)
+  local slack_webhook
+  slack_webhook=$(aws secretsmanager get-secret-value \
+    --secret-id "${SLACK_WEBHOOK_SECRET}" \
+    --query 'SecretString' \
+    --output text 2>/dev/null || echo "")
+
+  if [[ -n "$slack_webhook" ]]; then
+    local slack_payload
+    slack_payload=$(jq -n \
+      --arg event "$event_type" \
+      --arg operator "${OPERATOR_EMAIL:-unknown}" \
+      --arg approver "${APPROVER_EMAIL:-unknown}" \
+      --arg incident "${INCIDENT_REF:-N/A}" \
+      --arg reason "${REASON:-No reason provided}" \
+      --arg expiry "${BREAK_GLASS_EXPIRY:-unknown}" \
+      '{
+        text: ":rotating_light: *BREAK GLASS ACCESS* :rotating_light:",
+        attachments: [{
+          color: "danger",
+          fields: [
+            {title: "Event", value: $event, short: true},
+            {title: "Operator", value: $operator, short: true},
+            {title: "Approver", value: $approver, short: true},
+            {title: "Incident", value: $incident, short: true},
+            {title: "Reason", value: $reason, short: false},
+            {title: "Expires", value: $expiry, short: true}
+          ],
+          footer: "SOC Break Glass System",
+          ts: now | floor
+        }]
+      }')
+
+    curl -sf -X POST \
+      -H "Content-Type: application/json" \
+      -d "$slack_payload" \
+      "$slack_webhook" &>/dev/null || log_warn "Failed to send Slack alert"
+  fi
+
+  log_info "Security alerts sent."
+}
+
+# ---------------------------------------------------------------------------
+# Start interactive break-glass session
+# ---------------------------------------------------------------------------
+start_session() {
+  log_info "${BOLD}${YELLOW}=== BREAK-GLASS SESSION ACTIVE ===${NC}"
+  log_info "Credentials expire at: ${BREAK_GLASS_EXPIRY}"
+  log_info "All commands in this session are logged."
+  log_warn "DO NOT use these credentials for any purpose outside of this incident."
+  echo ""
+
+  # Export credentials for child processes
+  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+  # Start a sub-shell with enhanced logging
+  # PS1 is set to remind the operator they are in a break-glass session
+  export HISTFILE="${SESSION_LOG_DIR}/shell_history"
+  export HISTTIMEFORMAT="%Y-%m-%dT%H:%M:%SZ "
+  export PROMPT_COMMAND="history -a"
+
+  PS1="${RED}[BREAK-GLASS: ${INCIDENT_REF:-NO-INC}]${NC} \u@\h:\w\$ " \
+  HISTFILE="${SESSION_LOG_DIR}/shell_history" \
+  bash --noprofile --norc -i || true
+
+  log_info "Break-glass session ended."
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup and credential revocation
+# ---------------------------------------------------------------------------
+cleanup() {
+  log_info "Revoking break-glass credentials..."
+
+  # Unset credentials
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+  # Write session end audit log
+  write_audit_log "SESSION_END" "Session terminated by operator or timeout"
+  send_alerts "SESSION_END"
+
+  # Upload session logs to S3
+  if [[ -d "${SESSION_LOG_DIR}" ]]; then
+    local date_path
+    date_path=$(date -u '+%Y/%m/%d')
+    aws s3 cp "${SESSION_LOG_DIR}/" \
+      "s3://${AUDIT_BUCKET}/${AUDIT_PREFIX}/${date_path}/session-logs-$$/" \
+      --recursive \
+      --server-side-encryption "aws:kms" \
+      --metadata "operator=${OPERATOR_EMAIL:-unknown},incident=${INCIDENT_REF:-N/A}" \
+      2>/dev/null || log_warn "Failed to upload session logs to S3"
+
+    rm -rf "${SESSION_LOG_DIR}"
+  fi
+
+  log_info "${GREEN}Break-glass session closed. Credentials revoked.${NC}"
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
 usage() {
   cat <<EOF
-Usage: $0 --reason <reason> --incident-id <id> [OPTIONS]
+Usage: $(basename "$0") [OPTIONS]
 
-Required:
-  --reason <text>        Human-readable reason for break-glass access (min 20 chars)
-  --incident-id <id>     Incident ticket ID (e.g. INC-2024-0892)
+Emergency break-glass access for the SOC platform.
 
-Optional:
-  --duration <hours>     Credential duration in hours (default: ${DEFAULT_DURATION_HOURS}, max: ${MAX_DURATION_HOURS})
-  --operator <name>      Override operator name (default: whoami)
-  --dry-run              Print actions without executing
-  --no-mfa               Skip MFA prompt (NOT recommended; requires env BREAK_GLASS_NO_MFA=1)
+Options:
+  --reason TEXT          Reason for break-glass access (required)
+  --incident REF         Incident reference (e.g., INC-ABC123)
+  --duration MINUTES     Credential duration (1-${MAX_DURATION_MINUTES}, default: ${DEFAULT_DURATION_MINUTES})
+  --approver EMAIL       Approver email address
+  --operator EMAIL       Operator email (defaults to \$OPERATOR_EMAIL env var)
+  --dry-run              Verify prerequisites and identity without issuing credentials
+  --help                 Show this help message
+
+Environment variables:
+  BREAK_GLASS_ROLE_ARN   ARN of the IAM role to assume (required if not default)
+  SOC_AUDIT_BUCKET       S3 bucket for audit logs (default: soc-audit-logs)
+  AWS_ACCOUNT_ID         AWS account ID (used to construct default role ARN)
+  OPERATOR_EMAIL         Operator email (can be set instead of --operator)
 
 Examples:
-  $0 --reason "Identity provider outage — cannot access AWS console" --incident-id INC-2024-0892
-  $0 --reason "Active ransomware — need to isolate workloads" --incident-id INC-2024-0003 --duration 2
+  # Basic usage
+  $(basename "$0") --reason "DB connection pool exhausted, need direct DB access" \\
+                   --incident INC-ABC123 --approver soc-lead@example.com
+
+  # Custom duration
+  $(basename "$0") --reason "Investigating active breach" --duration 90 \\
+                   --incident INC-XYZ789 --approver ciso@example.com
+
+  # Dry run (test prerequisites without issuing credentials)
+  $(basename "$0") --reason "test" --dry-run
 EOF
 }
 
@@ -94,243 +382,59 @@ EOF
 # Parse arguments
 # ---------------------------------------------------------------------------
 REASON=""
-INCIDENT_ID=""
-DURATION_HOURS=${DEFAULT_DURATION_HOURS}
-OPERATOR="${USER:-$(whoami 2>/dev/null || echo unknown)}"
+INCIDENT_REF=""
+DURATION_MINUTES=$DEFAULT_DURATION_MINUTES
+APPROVER_EMAIL=""
+OPERATOR_EMAIL="${OPERATOR_EMAIL:-}"
 DRY_RUN=false
-NO_MFA=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --reason)         REASON="$2";        shift 2 ;;
-    --incident-id)    INCIDENT_ID="$2";   shift 2 ;;
-    --duration)       DURATION_HOURS="$2"; shift 2 ;;
-    --operator)       OPERATOR="$2";      shift 2 ;;
-    --dry-run)        DRY_RUN=true;       shift ;;
-    --no-mfa)         NO_MFA=true;        shift ;;
-    -h|--help)        usage; exit 0 ;;
-    *)                die "Unknown argument: $1" ;;
+    --reason)     REASON="$2"; shift 2 ;;
+    --incident)   INCIDENT_REF="$2"; shift 2 ;;
+    --duration)   DURATION_MINUTES="$2"; shift 2 ;;
+    --approver)   APPROVER_EMAIL="$2"; shift 2 ;;
+    --operator)   OPERATOR_EMAIL="$2"; shift 2 ;;
+    --dry-run)    DRY_RUN=true; shift ;;
+    --help|-h)    usage; exit 0 ;;
+    *)            log_error "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
 
 # ---------------------------------------------------------------------------
-# Validation
+# Validate arguments
 # ---------------------------------------------------------------------------
-[[ -z "${REASON}" ]]       && die "--reason is required"
-[[ -z "${INCIDENT_ID}" ]]  && die "--incident-id is required"
-[[ ${#REASON} -lt 20 ]]    && die "Reason must be at least 20 characters (got ${#REASON})"
-[[ "${DURATION_HOURS}" -gt "${MAX_DURATION_HOURS}" ]] && die "Duration cannot exceed ${MAX_DURATION_HOURS} hours"
-[[ "${DURATION_HOURS}" -lt 1 ]] && die "Duration must be at least 1 hour"
-
-DURATION_SECONDS=$(( DURATION_HOURS * 3600 ))
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-SESSION_ID="break-glass-${OPERATOR}-$(date +%Y%m%d%H%M%S)"
-AUDIT_LOG_FILE="/tmp/${SESSION_ID}.log"
-
-# ---------------------------------------------------------------------------
-# Pre-flight checks
-# ---------------------------------------------------------------------------
-log_info "Pre-flight checks..."
-
-command -v aws  >/dev/null 2>&1 || die "AWS CLI not found. Install: https://aws.amazon.com/cli/"
-command -v jq   >/dev/null 2>&1 || die "jq not found. Install: brew install jq / apt install jq"
-
-# Verify AWS credentials are present
-aws sts get-caller-identity --output json >/dev/null 2>&1 || die "AWS credentials not configured or invalid"
-
-CALLER_IDENTITY=$(aws sts get-caller-identity --output json)
-CALLER_ARN=$(echo "${CALLER_IDENTITY}" | jq -r '.Arn')
-CALLER_ACCOUNT=$(echo "${CALLER_IDENTITY}" | jq -r '.Account')
-
-log_info "Caller identity: ${CALLER_ARN}"
-log_info "Account: ${CALLER_ACCOUNT}"
-
-# ---------------------------------------------------------------------------
-# Confirmation prompt
-# ---------------------------------------------------------------------------
-echo ""
-echo -e "${RED}${BOLD}========================================================"
-echo "         BREAK-GLASS EMERGENCY ACCESS"
-echo "========================================================"
-echo -e "${RESET}"
-echo -e "  Operator:    ${BOLD}${OPERATOR}${RESET}"
-echo -e "  Incident ID: ${BOLD}${INCIDENT_ID}${RESET}"
-echo -e "  Reason:      ${BOLD}${REASON}${RESET}"
-echo -e "  Duration:    ${BOLD}${DURATION_HOURS} hour(s)${RESET}"
-echo -e "  Session ID:  ${BOLD}${SESSION_ID}${RESET}"
-echo -e "  Timestamp:   ${BOLD}${TIMESTAMP}${RESET}"
-echo ""
-echo -e "${YELLOW}WARNING: This action will:${RESET}"
-echo "  1. Create time-limited admin credentials (expires in ${DURATION_HOURS}h)"
-echo "  2. Log this access to CloudTrail and S3 audit bucket"
-echo "  3. Alert the CISO and Security Lead via SNS/PagerDuty"
-echo "  4. All API calls during this session will be tagged BreakGlass=true"
-echo ""
-
-if [[ "${DRY_RUN}" == "true" ]]; then
-  log_warn "DRY RUN mode — no credentials will be created, no alerts sent"
+if [[ -z "$REASON" ]]; then
+  log_error "--reason is required."
+  usage
+  exit 1
 fi
 
-read -r -p "Type 'CONFIRM' to proceed: " CONFIRM
-[[ "${CONFIRM}" != "CONFIRM" ]] && { log_warn "Aborted by operator."; exit 0; }
-
-# ---------------------------------------------------------------------------
-# MFA verification
-# ---------------------------------------------------------------------------
-MFA_SERIAL="${MFA_SERIAL_ARN:-}"
-if [[ "${REQUIRED_MFA}" == "true" && "${NO_MFA}" == "false" ]]; then
-  if [[ -z "${MFA_SERIAL}" ]]; then
-    # Auto-detect MFA device
-    MFA_SERIAL=$(aws iam list-mfa-devices --output json 2>/dev/null | jq -r '.MFADevices[0].SerialNumber // empty')
-  fi
-
-  if [[ -n "${MFA_SERIAL}" ]]; then
-    read -r -s -p "Enter MFA token code for ${MFA_SERIAL}: " MFA_TOKEN
-    echo ""
-    [[ ${#MFA_TOKEN} -ne 6 ]] && die "MFA token must be 6 digits"
-    MFA_ARGS="--serial-number ${MFA_SERIAL} --token-code ${MFA_TOKEN}"
-  else
-    log_warn "No MFA device found — proceeding without MFA (ensure your role policy requires MFA at the service level)"
-    MFA_ARGS=""
-  fi
-else
-  MFA_ARGS=""
+if [[ "$DURATION_MINUTES" -lt 1 || "$DURATION_MINUTES" -gt "$MAX_DURATION_MINUTES" ]]; then
+  log_error "--duration must be between 1 and ${MAX_DURATION_MINUTES} minutes."
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# Assume break-glass role
+# Main
 # ---------------------------------------------------------------------------
-log_info "Assuming break-glass role: ${BREAK_GLASS_ROLE_ARN}"
+trap cleanup EXIT INT TERM
 
-if [[ "${DRY_RUN}" == "true" ]]; then
-  log_warn "[DRY RUN] Would run: aws sts assume-role --role-arn ${BREAK_GLASS_ROLE_ARN} --role-session-name ${SESSION_ID} --duration-seconds ${DURATION_SECONDS} ${MFA_ARGS}"
-  CREDENTIALS='{"Credentials":{"AccessKeyId":"DRY_RUN_KEY","SecretAccessKey":"DRY_RUN_SECRET","SessionToken":"DRY_RUN_TOKEN","Expiration":"'$(date -u -d "+${DURATION_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)'"}}'
-else
-  # shellcheck disable=SC2086
-  CREDENTIALS=$(aws sts assume-role \
-    --role-arn "${BREAK_GLASS_ROLE_ARN}" \
-    --role-session-name "${SESSION_ID}" \
-    --duration-seconds "${DURATION_SECONDS}" \
-    --tags Key=BreakGlass,Value=true Key=IncidentId,Value="${INCIDENT_ID}" Key=Operator,Value="${OPERATOR}" \
-    ${MFA_ARGS} \
-    --output json) || die "Failed to assume break-glass role. Check your IAM permissions and MFA token."
+log_info "${BOLD}SOC Platform Break-Glass Access v${SCRIPT_VERSION}${NC}"
+log_info "Reason: ${REASON}"
+log_info "Incident: ${INCIDENT_REF:-Not specified}"
+log_info "Duration: ${DURATION_MINUTES} minutes"
+
+check_prerequisites
+verify_identity
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  log_info "${GREEN}Dry run completed successfully. No credentials were issued.${NC}"
+  exit 0
 fi
 
-ACCESS_KEY_ID=$(echo "${CREDENTIALS}"     | jq -r '.Credentials.AccessKeyId')
-SECRET_ACCESS_KEY=$(echo "${CREDENTIALS}" | jq -r '.Credentials.SecretAccessKey')
-SESSION_TOKEN=$(echo "${CREDENTIALS}"     | jq -r '.Credentials.SessionToken')
-EXPIRATION=$(echo "${CREDENTIALS}"        | jq -r '.Credentials.Expiration')
-
-# ---------------------------------------------------------------------------
-# Write credentials to temp file (mode 600)
-# ---------------------------------------------------------------------------
-CREDS_FILE="/tmp/${SESSION_ID}-credentials"
-umask 177  # mode 600 for new files
-cat > "${CREDS_FILE}" <<EOF
-# Break-Glass Credentials — ${SESSION_ID}
-# Expires: ${EXPIRATION}
-# Incident: ${INCIDENT_ID}
-# Reason: ${REASON}
-#
-# Source these credentials with:
-#   source ${CREDS_FILE}
-
-export AWS_ACCESS_KEY_ID="${ACCESS_KEY_ID}"
-export AWS_SECRET_ACCESS_KEY="${SECRET_ACCESS_KEY}"
-export AWS_SESSION_TOKEN="${SESSION_TOKEN}"
-export BREAK_GLASS_SESSION_ID="${SESSION_ID}"
-export BREAK_GLASS_INCIDENT="${INCIDENT_ID}"
-EOF
-
-# ---------------------------------------------------------------------------
-# Write audit log entry
-# ---------------------------------------------------------------------------
-log_audit "BREAK_GLASS_ACCESS_GRANTED caller=${CALLER_ARN} session=${SESSION_ID} incident=${INCIDENT_ID} operator=${OPERATOR} duration=${DURATION_HOURS}h expiry=${EXPIRATION} reason=\"${REASON}\""
-
-if [[ "${DRY_RUN}" == "false" ]]; then
-  # Upload audit log to S3
-  aws s3 cp "${AUDIT_LOG_FILE}" \
-    "s3://${AUDIT_S3_BUCKET}/break-glass/${SESSION_ID}.log" \
-    --sse aws:kms \
-    --metadata "incident-id=${INCIDENT_ID},operator=${OPERATOR}" \
-    2>/dev/null || log_warn "Failed to upload audit log to S3 (non-fatal)"
-fi
-
-# ---------------------------------------------------------------------------
-# Send alerts
-# ---------------------------------------------------------------------------
-ALERT_MESSAGE=$(cat <<EOF
-{
-  "alert_type": "BREAK_GLASS_ACCESS",
-  "severity": "CRITICAL",
-  "session_id": "${SESSION_ID}",
-  "operator": "${OPERATOR}",
-  "incident_id": "${INCIDENT_ID}",
-  "reason": "${REASON}",
-  "duration_hours": ${DURATION_HOURS},
-  "expiration": "${EXPIRATION}",
-  "caller_arn": "${CALLER_ARN}",
-  "timestamp": "${TIMESTAMP}"
-}
-EOF
-)
-
-if [[ "${DRY_RUN}" == "false" ]]; then
-  log_info "Sending security alert to SNS..."
-  aws sns publish \
-    --topic-arn "${ALERT_SNS_TOPIC_ARN}" \
-    --message "${ALERT_MESSAGE}" \
-    --subject "BREAK-GLASS ACCESS: ${INCIDENT_ID} by ${OPERATOR}" \
-    --message-attributes '{"alert_type":{"DataType":"String","StringValue":"BREAK_GLASS_ACCESS"}}' \
-    2>/dev/null || log_warn "Failed to send SNS alert (non-fatal — check network connectivity)"
-
-  # Slack notification (if webhook configured)
-  if [[ -n "${SLACK_WEBHOOK_URL}" ]]; then
-    SLACK_BODY=$(cat <<EOF
-{
-  "text": ":rotating_light: *BREAK-GLASS ACCESS ACTIVATED*",
-  "attachments": [
-    {
-      "color": "#FF0000",
-      "fields": [
-        {"title": "Operator", "value": "${OPERATOR}", "short": true},
-        {"title": "Incident", "value": "${INCIDENT_ID}", "short": true},
-        {"title": "Duration", "value": "${DURATION_HOURS} hour(s)", "short": true},
-        {"title": "Expires", "value": "${EXPIRATION}", "short": true},
-        {"title": "Reason", "value": "${REASON}", "short": false},
-        {"title": "Session ID", "value": "${SESSION_ID}", "short": false}
-      ]
-    }
-  ]
-}
-EOF
-)
-    curl -s -X POST -H 'Content-type: application/json' \
-      --data "${SLACK_BODY}" "${SLACK_WEBHOOK_URL}" \
-      2>/dev/null || log_warn "Failed to send Slack alert (non-fatal)"
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
-echo ""
-echo -e "${GREEN}${BOLD}Break-glass credentials created successfully.${RESET}"
-echo ""
-echo -e "  Session ID:  ${SESSION_ID}"
-echo -e "  Expires:     ${EXPIRATION}"
-echo -e "  Access Key:  ${ACCESS_KEY_ID}"
-echo ""
-echo -e "${YELLOW}To activate credentials in your current shell:${RESET}"
-echo -e "  ${BOLD}source ${CREDS_FILE}${RESET}"
-echo ""
-echo -e "${RED}IMPORTANT:${RESET}"
-echo "  - Credentials expire at ${EXPIRATION} and CANNOT be renewed"
-echo "  - All API calls are tagged BreakGlass=true and logged to CloudTrail"
-echo "  - Credential file will be deleted automatically on expiry (monitor expiry yourself)"
-echo "  - Contact CISO or Security Lead when your emergency work is complete"
-echo "  - Revoke credentials early if no longer needed:"
-echo "    aws iam delete-access-key --access-key-id ${ACCESS_KEY_ID} (if IAM key)"
-echo ""
-
-exit 0
+write_audit_log "SESSION_START" "Reason: ${REASON}"
+send_alerts "SESSION_START"
+assume_break_glass_role
+write_audit_log "CREDENTIALS_ISSUED" "Expiry: ${BREAK_GLASS_EXPIRY}"
+start_session

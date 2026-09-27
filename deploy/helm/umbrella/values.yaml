@@ -1,54 +1,151 @@
-# Umbrella chart values for the full SOC Platform.
-# Override per-environment using values-staging.yaml, values-production.yaml, etc.
+# Umbrella chart values for the AI Agent SOC platform.
+# These values override the sub-chart defaults.
+#
+# Sub-chart values are namespaced under their alias:
+#   api.*          → overrides deploy/helm/api/values.yaml
+#   agentRuntime.* → overrides deploy/helm/agent-runtime/values.yaml
 #
 # Usage:
-#   helm dependency update deploy/helm/umbrella
-#   helm upgrade --install soc-platform deploy/helm/umbrella \
-#     --namespace soc-platform \
-#     --create-namespace \
-#     -f deploy/helm/umbrella/values.yaml \
-#     -f deploy/helm/umbrella/values-production.yaml \
-#     --set soc-api.image.tag=v1.2.3 \
-#     --set soc-agent-runtime.image.tag=v1.2.3
+#   helm install soc-platform ./deploy/helm/umbrella \
+#     -n soc-platform \
+#     -f ./deploy/helm/umbrella/values.yaml \
+#     --set api.image.tag=v1.2.3 \
+#     --set agentRuntime.image.tag=v1.2.3
 
 # ---------------------------------------------------------------------------
-# Global settings (propagated to all sub-charts)
+# Global values shared across all sub-charts
 # ---------------------------------------------------------------------------
 global:
-  # Container image registry prefix (empty = use each chart's default)
-  imageRegistry: "ghcr.io"
+  # Image tag applied to all services when not overridden per-service
+  imageTag: ""
 
-  # Image pull secrets — applied to all pods
+  # AWS region used by all services
+  awsRegion: "us-east-1"
+
+  # Kubernetes namespace (ArgoCD handles namespace creation)
+  namespace: "soc-platform"
+
+  # External Secrets Operator store reference
+  externalSecrets:
+    enabled: true
+    secretStoreName: "soc-aws-secrets-manager"
+    refreshInterval: "1h"
+
+  # Istio service mesh
+  istio:
+    enabled: true
+    inject: true
+
+  # OpenTelemetry collector endpoint
+  otel:
+    endpoint: "http://otel-collector.observability.svc.cluster.local:4317"
+    insecure: true
+
+  # Shared image pull secrets
   imagePullSecrets:
     - name: ghcr-pull-secret
 
-  # Default storage class for PVCs
-  storageClass: "gp3"
-
-  # Platform-wide labels added to all resources
-  labels:
-    app.kubernetes.io/managed-by: Helm
-    platform: ai-agent-soc
+  # Common labels applied to all resources
+  commonLabels:
+    app.kubernetes.io/part-of: ai-agent-soc
     environment: production
-
-  # Tenant ID placeholder — override per deployment for single-tenant mode
-  tenantId: ""
+    managed-by: helm
 
 # ---------------------------------------------------------------------------
-# SOC API sub-chart
+# Sub-chart enable/disable flags
 # ---------------------------------------------------------------------------
-soc-api:
+api:
   enabled: true
 
-  replicaCount: 3
+agentRuntime:
+  enabled: true
+
+# ---------------------------------------------------------------------------
+# API service overrides
+# ---------------------------------------------------------------------------
+api:
+  enabled: true
+
+  replicaCount: 2
 
   image:
-    tag: "latest"  # Override via CI: --set soc-api.image.tag=<git-sha>
+    repository: ghcr.io/acme-corp/soc-api
+    tag: ""  # Overrides global.imageTag when set
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: soc-api.acme-corp.internal
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: soc-api-tls
+        hosts:
+          - soc-api.acme-corp.internal
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
 
   autoscaling:
     enabled: true
-    minReplicas: 3
-    maxReplicas: 15
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  env:
+    LOG_LEVEL: "INFO"
+    APP_ENV: "production"
+    AWS_DEFAULT_REGION: "us-east-1"
+    ENABLE_MITRE_ENRICHMENT: "true"
+    ENABLE_POSTURE_SCORING: "true"
+    ENABLE_THREAT_HUNTING: "true"
+
+  config:
+    opensearch:
+      host: "opensearch.soc-platform.svc.cluster.local"
+      port: 9200
+      use_ssl: true
+      mitre_index: "mitre-attck-v14"
+      events_index_pattern: "soc-events-*"
+    jwt:
+      algorithm: "RS256"
+      audience: "ai-agent-soc-api"
+      issuer: "ai-agent-soc"
+      expiry_seconds: 3600
+    posture:
+      refresh_interval_seconds: 3600
+
+  serviceAccount:
+    create: true
+    annotations:
+      eks.amazonaws.com/role-arn: ""  # Override with actual IRSA role ARN
+
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+
+# ---------------------------------------------------------------------------
+# Agent Runtime overrides
+# ---------------------------------------------------------------------------
+agentRuntime:
+  enabled: true
+
+  replicaCount: 2
+
+  image:
+    repository: ghcr.io/acme-corp/soc-agent-runtime
+    tag: ""  # Overrides global.imageTag when set
 
   resources:
     requests:
@@ -58,186 +155,70 @@ soc-api:
       cpu: "2000m"
       memory: "2Gi"
 
-  ingress:
-    enabled: true
-    hosts:
-      - host: api.soc.acme-corp.com
-        paths:
-          - path: /api/v1
-            pathType: Prefix
-    tls:
-      - secretName: soc-api-tls
-        hosts:
-          - api.soc.acme-corp.com
-
-  env:
-    - name: APP_ENV
-      value: "production"
-    - name: WORKERS
-      value: "4"
-    - name: LOG_LEVEL
-      value: "INFO"
-
-# ---------------------------------------------------------------------------
-# Agent Runtime sub-chart
-# ---------------------------------------------------------------------------
-soc-agent-runtime:
-  enabled: true
-
-  replicaCount: 2
-
-  image:
-    tag: "latest"  # Override via CI
-
-  agents:
-    triage:
-      enabled: true
-      replicas: 3
-      model: "claude-sonnet-4-6"
-      maxConcurrentJobs: 15
-    threatHunt:
-      enabled: true
-      replicas: 2
-      model: "claude-opus-4-5"
-      maxConcurrentJobs: 5
-    posture:
-      enabled: true
-      replicas: 1
-      model: "claude-haiku-4-5"
-      scheduleIntervalMinutes: 15
-
   autoscaling:
     enabled: true
-    keda:
-      enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 60
 
-  resources:
-    requests:
-      cpu: "500m"
-      memory: "1Gi"
-    limits:
-      cpu: "2000m"
-      memory: "4Gi"
+  env:
+    LOG_LEVEL: "INFO"
+    APP_ENV: "production"
+    AWS_DEFAULT_REGION: "us-east-1"
+    BEDROCK_REGION: "us-east-1"
+    TRIAGE_MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0"
+    HUNT_MODEL_ID: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    SQS_MAX_CONCURRENT_WORKERS: "20"
+    AUTO_CREATE_INCIDENT_SEVERITY: "HIGH,CRITICAL"
+    AUTO_CREATE_INCIDENT_CONFIDENCE: "0.85"
 
-# ---------------------------------------------------------------------------
-# OpenTelemetry Collector (official upstream chart)
-# ---------------------------------------------------------------------------
-opentelemetry-collector:
-  enabled: true
-
-  mode: deployment  # "deployment" or "daemonset"
-
-  replicaCount: 2
-
-  image:
-    repository: otel/opentelemetry-collector-contrib
-    tag: "0.92.0"
-
-  resources:
-    requests:
-      cpu: "200m"
-      memory: "256Mi"
-    limits:
-      cpu: "1000m"
-      memory: "1Gi"
-
-  # Mount our custom collector config
-  configMap:
+  serviceAccount:
     create: true
-    existingName: ""
-
-  config:
-    receivers:
-      otlp:
-        protocols:
-          grpc:
-            endpoint: "0.0.0.0:4317"
-          http:
-            endpoint: "0.0.0.0:4318"
-
-    processors:
-      memory_limiter:
-        check_interval: 1s
-        limit_mib: 512
-        spike_limit_mib: 128
-      batch:
-        send_batch_size: 1000
-        timeout: 5s
-
-    exporters:
-      otlp:
-        endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-otel-backend:4317}"
-        tls:
-          insecure: true
-      debug:
-        verbosity: basic
-
-    service:
-      pipelines:
-        traces:
-          receivers: [otlp]
-          processors: [memory_limiter, batch]
-          exporters: [otlp, debug]
-        metrics:
-          receivers: [otlp]
-          processors: [memory_limiter, batch]
-          exporters: [otlp, debug]
-        logs:
-          receivers: [otlp]
-          processors: [memory_limiter, batch]
-          exporters: [otlp, debug]
-
-  service:
-    type: ClusterIP
+    annotations:
+      eks.amazonaws.com/role-arn: ""  # Override with IRSA role ARN (Bedrock + SQS + RDS)
 
   podAnnotations:
     prometheus.io/scrape: "true"
-    prometheus.io/port: "8888"
+    prometheus.io/port: "8081"
+    prometheus.io/path: "/metrics"
 
 # ---------------------------------------------------------------------------
-# Shared platform configuration
+# Environment-specific overrides (applied via -f values-{env}.yaml)
 # ---------------------------------------------------------------------------
-platform:
-  # AWS region for all AWS SDK calls
-  awsRegion: "us-east-1"
 
-  # OpenSearch cluster endpoint
-  opensearch:
-    endpoint: ""  # Set via ExternalSecret
-    indexPrefix: "soc"
-    replicaCount: 1
-    shards: 5
+# Example: staging environment
+# To create: cp values.yaml values-staging.yaml and set:
+#
+# global:
+#   namespace: soc-platform-staging
+#
+# api:
+#   replicaCount: 1
+#   autoscaling:
+#     minReplicas: 1
+#     maxReplicas: 3
+#   env:
+#     APP_ENV: "staging"
+#     LOG_LEVEL: "DEBUG"
+#
+# agentRuntime:
+#   replicaCount: 1
+#   autoscaling:
+#     minReplicas: 1
+#     maxReplicas: 5
+#   env:
+#     APP_ENV: "staging"
+#     LOG_LEVEL: "DEBUG"
+#     TRIAGE_MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0"
 
-  # PostgreSQL connection (managed via RDS)
-  database:
-    host: ""       # Set via ExternalSecret
-    port: 5432
-    name: "soc_platform"
-    poolSize: 20
-    maxOverflow: 10
-
-  # SQS queue configuration
-  sqs:
-    triageQueue: ""    # Set via ExternalSecret
-    huntQueue: ""      # Set via ExternalSecret
-
-  # Anthropic API configuration
-  anthropic:
-    baseUrl: "https://api.anthropic.com"
-    apiVersion: "2023-06-01"
-    maxRetries: 3
-    timeoutSeconds: 60
-    promptCaching:
-      enabled: true
-
-  # Multi-tenancy
-  multiTenancy:
-    enabled: true
-    isolationLevel: "namespace"  # namespace | label
-
-  # Feature flags
-  features:
-    piiScrubbing: true
-    crossCloudCorrelation: true
-    adaptiveTriage: true
-    autoContainment: false  # Requires explicit enablement per tenant
+# ---------------------------------------------------------------------------
+# Network policies (umbrella-level)
+# ---------------------------------------------------------------------------
+networkPolicies:
+  enabled: true
+  defaultDenyAll: true
+  allowNamespaces:
+    - kube-system
+    - observability
+    - ingress-nginx
+    - istio-system

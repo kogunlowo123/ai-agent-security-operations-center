@@ -1,21 +1,23 @@
 ---
-# ArgoCD App-of-Apps
-# Manages all SOC platform services as a single root Application.
-# Deploy this file to bootstrap the entire platform:
+# ArgoCD Application of Applications
+# Manages all SOC platform child applications via GitOps.
+# Deploy this manifest to the ArgoCD control plane namespace.
+#
+# Usage:
 #   kubectl apply -f deploy/argocd/app-of-apps.yaml -n argocd
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: soc-platform
+  name: soc-platform-app-of-apps
   namespace: argocd
   labels:
-    app.kubernetes.io/name: soc-platform
     app.kubernetes.io/part-of: ai-agent-soc
-    environment: production
+    app.kubernetes.io/managed-by: argocd
   annotations:
-    argocd.argoproj.io/sync-wave: "0"
-    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: "argocd-deployments"
-    notifications.argoproj.io/subscribe.on-sync-failed.slack: "soc-alerts"
+    # Notify the #soc-deployments Slack channel on sync
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: soc-deployments
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: soc-alerts
+    notifications.argoproj.io/subscribe.on-health-degraded.slack: soc-alerts
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
@@ -24,12 +26,16 @@ spec:
     repoURL: https://github.com/acme-corp/ai-agent-security-operations-center
     targetRevision: HEAD
     path: deploy/argocd/apps
+    directory:
+      recurse: true
+      include: "*.yaml"
+      exclude: "app-of-apps.yaml"
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd
   syncPolicy:
     automated:
-      prune: false        # Never auto-prune child apps — require explicit deletion
+      prune: true
       selfHeal: true
       allowEmpty: false
     syncOptions:
@@ -37,156 +43,86 @@ spec:
       - PrunePropagationPolicy=foreground
       - PruneLast=true
       - ApplyOutOfSyncOnly=true
+      - RespectIgnoreDifferences=true
     retry:
       limit: 5
       backoff:
-        duration: 10s
+        duration: 5s
         factor: 2
         maxDuration: 3m
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas  # Allow HPA to manage replicas
   revisionHistoryLimit: 10
-
 ---
-# Child Application: SOC API
+# ArgoCD Project defining RBAC and source/destination restrictions
 apiVersion: argoproj.io/v1alpha1
-kind: Application
+kind: AppProject
 metadata:
-  name: soc-api
+  name: soc-platform
   namespace: argocd
   labels:
-    app.kubernetes.io/name: soc-api
     app.kubernetes.io/part-of: ai-agent-soc
-    tier: api
-  annotations:
-    argocd.argoproj.io/sync-wave: "2"
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
-  project: soc-platform
-  source:
-    repoURL: https://github.com/acme-corp/ai-agent-security-operations-center
-    targetRevision: HEAD
-    path: deploy/helm/api
-    helm:
-      releaseName: soc-api
-      valueFiles:
-        - values.yaml
-        - values-production.yaml
-      parameters:
-        - name: image.tag
-          value: "WILL_BE_REPLACED_BY_CI"
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: soc-platform
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      - ServerSideApply=true
-    retry:
-      limit: 3
-      backoff:
-        duration: 5s
-        factor: 2
-        maxDuration: 1m
-  revisionHistoryLimit: 5
-  ignoreDifferences:
-    - group: apps
-      kind: Deployment
-      jsonPointers:
-        - /spec/replicas  # Managed by HPA
-
----
-# Child Application: Agent Runtime
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: soc-agent-runtime
-  namespace: argocd
-  labels:
-    app.kubernetes.io/name: soc-agent-runtime
-    app.kubernetes.io/part-of: ai-agent-soc
-    tier: agents
-  annotations:
-    argocd.argoproj.io/sync-wave: "3"
-  finalizers:
-    - resources-finalizer.argocd.argoproj.io
-spec:
-  project: soc-platform
-  source:
-    repoURL: https://github.com/acme-corp/ai-agent-security-operations-center
-    targetRevision: HEAD
-    path: deploy/helm/agent-runtime
-    helm:
-      releaseName: soc-agent-runtime
-      valueFiles:
-        - values.yaml
-        - values-production.yaml
-      parameters:
-        - name: image.tag
-          value: "WILL_BE_REPLACED_BY_CI"
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: soc-agents
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      - ServerSideApply=true
-    retry:
-      limit: 3
-      backoff:
-        duration: 5s
-        factor: 2
-        maxDuration: 1m
-  revisionHistoryLimit: 5
-  ignoreDifferences:
-    - group: apps
-      kind: Deployment
-      jsonPointers:
-        - /spec/replicas
-
----
-# Child Application: OpenTelemetry Collector
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: soc-otel-collector
-  namespace: argocd
-  labels:
-    app.kubernetes.io/name: soc-otel-collector
-    app.kubernetes.io/part-of: ai-agent-soc
-    tier: observability
-  annotations:
-    argocd.argoproj.io/sync-wave: "1"
-  finalizers:
-    - resources-finalizer.argocd.argoproj.io
-spec:
-  project: soc-platform
-  source:
-    repoURL: https://github.com/acme-corp/ai-agent-security-operations-center
-    targetRevision: HEAD
-    path: deploy/helm/otel-collector
-    helm:
-      releaseName: soc-otel-collector
-      valueFiles:
-        - values.yaml
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: soc-observability
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-    retry:
-      limit: 3
-      backoff:
-        duration: 5s
-        factor: 2
-        maxDuration: 1m
-  revisionHistoryLimit: 3
+  description: "AI Agent Security Operations Centre platform"
+  sourceRepos:
+    - "https://github.com/acme-corp/ai-agent-security-operations-center"
+    - "https://charts.bitnami.com/bitnami"
+    - "https://opensearch-project.github.io/helm-charts"
+    - "https://charts.jetstack.io"
+  destinations:
+    - namespace: soc-platform
+      server: https://kubernetes.default.svc
+    - namespace: soc-ingress
+      server: https://kubernetes.default.svc
+    - namespace: observability
+      server: https://kubernetes.default.svc
+    - namespace: argocd
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRole
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRoleBinding
+    - group: "networking.k8s.io"
+      kind: IngressClass
+    - group: "apiextensions.k8s.io"
+      kind: CustomResourceDefinition
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  roles:
+    - name: soc-deployer
+      description: Role for CI/CD pipeline deployments
+      policies:
+        - p, proj:soc-platform:soc-deployer, applications, get, soc-platform/*, allow
+        - p, proj:soc-platform:soc-deployer, applications, sync, soc-platform/*, allow
+        - p, proj:soc-platform:soc-deployer, applications, update, soc-platform/*, allow
+      jwtTokens: []
+    - name: soc-reader
+      description: Read-only access for developers
+      policies:
+        - p, proj:soc-platform:soc-reader, applications, get, soc-platform/*, allow
+      jwtTokens: []
+  syncWindows:
+    # Block automated syncs during business-critical hours on weekdays
+    - kind: deny
+      schedule: "0 9 * * 1-5"
+      duration: "8h"
+      applications:
+        - "soc-api"
+        - "soc-agent-runtime"
+      manualSync: true  # Manual sync still allowed during deny window
+    # Always allow sync for infrastructure components
+    - kind: allow
+      schedule: "* * * * *"
+      duration: "24h"
+      applications:
+        - "soc-platform-infra"
+        - "soc-observability"

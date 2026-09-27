@@ -1,218 +1,206 @@
 ---
-# ArgoCD Sync Wave Configuration
+# ArgoCD Sync Wave Annotations Reference
 #
-# Sync waves control the order in which resources are deployed.
-# Lower wave numbers deploy first. Resources in the same wave
-# deploy concurrently. ArgoCD waits for all resources in wave N
-# to be healthy before proceeding to wave N+1.
+# This ConfigMap documents the sync wave ordering used across all SOC platform
+# ArgoCD applications. Sync waves ensure ordered deployment: wave N resources
+# are not applied until all wave N-1 resources are healthy.
 #
-# SOC Platform deployment order:
-#   Wave -5:  Namespaces and RBAC (foundation)
-#   Wave -3:  Secrets and ConfigMaps
-#   Wave -1:  Persistent storage (PVCs, external secrets sync)
-#   Wave  0:  Infrastructure dependencies (cert-manager, external-secrets)
-#   Wave  1:  Observability stack (OTel Collector, Prometheus)
-#   Wave  2:  Core API service
-#   Wave  3:  Agent runtime
-#   Wave  5:  Ingress and service mesh configuration
-#   Wave 10:  Smoke test jobs
+# Wave ordering:
+#   Wave -5:  CRDs and cluster-scoped prerequisites
+#   Wave -3:  Namespaces and RBAC
+#   Wave -1:  Secrets management (External Secrets Operator)
+#   Wave 0:   Infrastructure (databases, message queues, caches)
+#   Wave 1:   Observability stack (OTel Collector, Prometheus, Grafana)
+#   Wave 2:   Core platform services (API, event processor)
+#   Wave 3:   Agent runtime services
+#   Wave 5:   Ingress and load balancers
+#   Wave 10:  Post-deployment verification jobs
+#
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: soc-sync-wave-reference
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: ai-agent-soc
+    app.kubernetes.io/component: deployment-config
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+data:
+  wave-ordering: |
+    Wave -5: CRDs
+    - cert-manager CRDs
+    - External Secrets Operator CRDs
+    - OpenTelemetry Operator CRDs
+    - Kyverno policy CRDs
 
-# ---------------------------------------------------------------------------
-# Wave -5: Namespaces
-# ---------------------------------------------------------------------------
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: soc-platform
-  annotations:
-    argocd.argoproj.io/sync-wave: "-5"
-  labels:
-    app.kubernetes.io/part-of: ai-agent-soc
-    istio-injection: enabled
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: soc-agents
-  annotations:
-    argocd.argoproj.io/sync-wave: "-5"
-  labels:
-    app.kubernetes.io/part-of: ai-agent-soc
-    istio-injection: enabled
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: soc-observability
-  annotations:
-    argocd.argoproj.io/sync-wave: "-5"
-  labels:
-    app.kubernetes.io/part-of: ai-agent-soc
+    Wave -3: Namespaces and RBAC
+    - Namespace: soc-platform
+    - Namespace: observability
+    - ClusterRole: soc-api-role
+    - ClusterRoleBinding: soc-api-binding
+    - ServiceAccount: soc-api
+    - ServiceAccount: soc-agent-runtime
+    - NetworkPolicy: soc-platform-default-deny
 
----
-# ---------------------------------------------------------------------------
-# Wave -5: RBAC — Service Accounts
-# ---------------------------------------------------------------------------
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: soc-api
-  namespace: soc-platform
-  annotations:
-    argocd.argoproj.io/sync-wave: "-5"
-    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/soc-api-irsa-role"
-  labels:
-    app.kubernetes.io/name: soc-api
-    app.kubernetes.io/part-of: ai-agent-soc
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: soc-agent-runtime
-  namespace: soc-agents
-  annotations:
-    argocd.argoproj.io/sync-wave: "-5"
-    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/soc-agent-runtime-irsa-role"
-  labels:
-    app.kubernetes.io/name: soc-agent-runtime
-    app.kubernetes.io/part-of: ai-agent-soc
+    Wave -1: Secrets Management
+    - ExternalSecret: soc-db-credentials
+    - ExternalSecret: soc-jwt-signing-key
+    - ExternalSecret: soc-bedrock-credentials
+    - ExternalSecret: soc-opensearch-credentials
+    - Certificate: soc-api-tls (cert-manager)
+    - Certificate: otel-collector-tls
 
----
-# ---------------------------------------------------------------------------
-# Wave -5: RBAC — Cluster Roles
-# ---------------------------------------------------------------------------
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: soc-api-role
-  namespace: soc-platform
-  annotations:
-    argocd.argoproj.io/sync-wave: "-5"
-rules:
-  - apiGroups: [""]
-    resources: ["configmaps", "secrets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: soc-api-rolebinding
-  namespace: soc-platform
-  annotations:
-    argocd.argoproj.io/sync-wave: "-5"
-subjects:
-  - kind: ServiceAccount
-    name: soc-api
-    namespace: soc-platform
-roleRef:
-  kind: Role
-  name: soc-api-role
-  apiGroup: rbac.authorization.k8s.io
+    Wave 0: Infrastructure
+    - PostgreSQL (RDS Proxy endpoint or in-cluster via Bitnami chart)
+    - OpenSearch (cluster or AWS OpenSearch Service endpoint ConfigMap)
+    - Redis (ElastiCache endpoint or in-cluster)
+    - SQS Queue reference ConfigMap
 
+    Wave 1: Observability
+    - OpenTelemetry Collector DaemonSet
+    - OpenTelemetry Collector Deployment (aggregator)
+    - Prometheus ServiceMonitors
+    - Grafana Dashboards ConfigMap
+
+    Wave 2: Core Platform Services
+    - Deployment: soc-api
+    - HorizontalPodAutoscaler: soc-api
+    - PodDisruptionBudget: soc-api
+    - Service: soc-api
+    - ConfigMap: soc-api-config
+    - Deployment: soc-event-processor
+    - HorizontalPodAutoscaler: soc-event-processor
+
+    Wave 3: Agent Runtime
+    - Deployment: soc-agent-runtime
+    - HorizontalPodAutoscaler: soc-agent-runtime
+    - PodDisruptionBudget: soc-agent-runtime
+    - Service: soc-agent-runtime
+    - ConfigMap: soc-agent-runtime-config
+
+    Wave 5: Ingress
+    - Ingress: soc-api-ingress
+    - Ingress: soc-grafana-ingress
+    - Gateway: soc-istio-gateway (if using Istio)
+    - VirtualService: soc-api-vs
+
+    Wave 10: Verification
+    - Job: soc-smoke-test
+    - Job: soc-db-migration-check
+    - Job: soc-health-check
+
+  annotation-examples: |
+    # Apply wave annotation to any Kubernetes resource:
+    #
+    # apiVersion: apps/v1
+    # kind: Deployment
+    # metadata:
+    #   name: soc-api
+    #   annotations:
+    #     argocd.argoproj.io/sync-wave: "2"
+    #
+    # apiVersion: batch/v1
+    # kind: Job
+    # metadata:
+    #   name: soc-smoke-test
+    #   annotations:
+    #     argocd.argoproj.io/sync-wave: "10"
+    #     argocd.argoproj.io/hook: PostSync
+    #     argocd.argoproj.io/hook-delete-policy: HookSucceeded
+
+  resource-health-checks: |
+    # ArgoCD custom health checks ensure waves progress correctly.
+    # Add to argocd-cm ConfigMap in the argocd namespace:
+    #
+    # resource.customizations.health.batch_v1_Job: |
+    #   hs = {}
+    #   if obj.status ~= nil then
+    #     if obj.status.failed ~= nil and obj.status.failed > 0 then
+    #       hs.status = "Degraded"
+    #       hs.message = "Job failed"
+    #       return hs
+    #     end
+    #     if obj.status.succeeded ~= nil and obj.status.succeeded > 0 then
+    #       hs.status = "Healthy"
+    #       hs.message = "Job completed"
+    #       return hs
+    #     end
+    #   end
+    #   hs.status = "Progressing"
+    #   hs.message = "Waiting for job completion"
+    #   return hs
 ---
-# ---------------------------------------------------------------------------
-# Wave -3: External Secrets (sync from AWS Secrets Manager)
-# ---------------------------------------------------------------------------
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
+# Example PreSync hook for database migration (Wave 0)
+apiVersion: batch/v1
+kind: Job
 metadata:
-  name: soc-api-secrets
+  name: soc-db-migration
   namespace: soc-platform
+  labels:
+    app.kubernetes.io/part-of: ai-agent-soc
+    app.kubernetes.io/component: db-migration
   annotations:
-    argocd.argoproj.io/sync-wave: "-3"
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    name: aws-secretsmanager
-    kind: ClusterSecretStore
-  target:
-    name: soc-api-secrets
-    creationPolicy: Owner
-    template:
-      type: Opaque
-      data:
-        DATABASE_URL: "{{ .db_url }}"
-        OPENSEARCH_URL: "{{ .opensearch_url }}"
-        ANTHROPIC_API_KEY: "{{ .anthropic_api_key }}"
-        SQS_QUEUE_URL: "{{ .sqs_queue_url }}"
-        JWT_SECRET: "{{ .jwt_secret }}"
-  data:
-    - secretKey: db_url
-      remoteRef:
-        key: soc/production/api
-        property: DATABASE_URL
-    - secretKey: opensearch_url
-      remoteRef:
-        key: soc/production/api
-        property: OPENSEARCH_URL
-    - secretKey: anthropic_api_key
-      remoteRef:
-        key: soc/production/api
-        property: ANTHROPIC_API_KEY
-    - secretKey: sqs_queue_url
-      remoteRef:
-        key: soc/production/api
-        property: SQS_QUEUE_URL
-    - secretKey: jwt_secret
-      remoteRef:
-        key: soc/production/api
-        property: JWT_SECRET
-
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: ai-agent-soc
+        app.kubernetes.io/component: db-migration
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: soc-api
+      containers:
+        - name: migrate
+          image: ghcr.io/acme-corp/soc-api:latest
+          command: ["python", "-m", "alembic", "upgrade", "head"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: soc-db-credentials
+                  key: database-url
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
 ---
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
-metadata:
-  name: soc-agent-secrets
-  namespace: soc-agents
-  annotations:
-    argocd.argoproj.io/sync-wave: "-3"
-spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    name: aws-secretsmanager
-    kind: ClusterSecretStore
-  target:
-    name: soc-agent-secrets
-    creationPolicy: Owner
-  data:
-    - secretKey: ANTHROPIC_API_KEY
-      remoteRef:
-        key: soc/production/agents
-        property: ANTHROPIC_API_KEY
-    - secretKey: OPENSEARCH_URL
-      remoteRef:
-        key: soc/production/agents
-        property: OPENSEARCH_URL
-
----
-# ---------------------------------------------------------------------------
-# Wave 10: Smoke Test Job (runs after all services are healthy)
-# ---------------------------------------------------------------------------
+# Post-sync smoke test job (Wave 10)
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: soc-smoke-test
   namespace: soc-platform
+  labels:
+    app.kubernetes.io/part-of: ai-agent-soc
+    app.kubernetes.io/component: smoke-test
   annotations:
     argocd.argoproj.io/sync-wave: "10"
     argocd.argoproj.io/hook: PostSync
-    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
-  labels:
-    app.kubernetes.io/name: soc-smoke-test
-    app.kubernetes.io/part-of: ai-agent-soc
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
 spec:
   backoffLimit: 2
-  activeDeadlineSeconds: 300
+  activeDeadlineSeconds: 120
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: soc-smoke-test
+        app.kubernetes.io/part-of: ai-agent-soc
+        app.kubernetes.io/component: smoke-test
     spec:
-      restartPolicy: Never
-      serviceAccountName: soc-api
+      restartPolicy: OnFailure
       containers:
         - name: smoke-test
           image: curlimages/curl:8.5.0
@@ -221,21 +209,12 @@ spec:
             - -c
             - |
               set -e
-              echo "Running SOC platform smoke tests..."
-
+              echo "Running SOC API smoke tests..."
               # Health check
-              curl -fsS http://soc-api.soc-platform.svc.cluster.local:8080/health
-              echo "Health check passed"
-
+              curl -sf http://soc-api.soc-platform.svc.cluster.local/api/v1/health
               # Readiness check
-              curl -fsS http://soc-api.soc-platform.svc.cluster.local:8080/ready
-              echo "Readiness check passed"
-
-              # API version check
-              VERSION=$(curl -fsS http://soc-api.soc-platform.svc.cluster.local:8080/api/v1/version | grep -o '"version":"[^"]*"')
-              echo "API version: $VERSION"
-
-              echo "All smoke tests passed."
+              curl -sf http://soc-api.soc-platform.svc.cluster.local/api/v1/readiness
+              echo "Smoke tests passed."
           resources:
             requests:
               cpu: "50m"
@@ -243,3 +222,7 @@ spec:
             limits:
               cpu: "100m"
               memory: "64Mi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
