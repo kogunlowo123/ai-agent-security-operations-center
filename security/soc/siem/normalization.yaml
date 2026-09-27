@@ -1,0 +1,45 @@
+# Field normalization mappings — source repo → SOC canonical schema
+version: "1.0"
+description: "Normalizes fields from each upstream source repository to the SOC ECS-based canonical schema"
+canonical_schema_version: "8.11"
+sources:
+  ai-agent-identity-governance:
+    timestamp:          "@timestamp"
+    agent_id:           "agent.id"
+    tenant_id:          "tenant.id"
+    event_type:         "event.action"
+    source_ip:          "source.ip"
+    response_code:      "http.response.status_code"
+    tier:               "agent.tier"
+    scopes:             "identity.token.scopes"
+    token_jti:          "identity.token.jti"
+
+  ai-agent-policy-enforcement:
+    timestamp:          "@timestamp"
+    decision:           "policy.decision"
+    policy_path:        "policy.path"
+    agent_id:           "agent.id"
+    tenant_id:          "tenant.id"
+    input_method:       "http.request.method"
+    input_path:         "url.path"
+    latency_ms:         "event.duration"
+
+  soc-gateway-litellm:
+    timestamp:          "@timestamp"
+    model:              "llm.model"
+    tenant_id:          "tenant.id"
+    agent_id:           "agent.id"
+    prompt_tokens:      "llm.usage.prompt_tokens"
+    completion_tokens:  "llm.usage.completion_tokens"
+    latency_ms:         "event.duration"
+    status:             "event.outcome"
+    provider:           "llm.provider"
+
+  kubernetes-audit:
+    timestamp:          "@timestamp"
+    verb:               "event.action"
+    resource:           "kubernetes.resource"
+    namespace:          "kubernetes.namespace"
+    user_agent:         "user_agent.original"
+    source_ip:          "source.ip"
+    response_code:      "http.response.status_code"

@@ -1,0 +1,158 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in the AI Agent SOC
+title: "[Bug]: "
+labels:
+  - "bug"
+  - "needs-triage"
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Bug Report
+        Thank you for reporting a bug. Please fill out this form as completely as possible to help us triage and fix the issue quickly.
+
+        > **Security Note:** If this bug has security implications (e.g., agent escape, unauthorized access, data leak), please use the [Security Finding](?template=security-finding.yml) template instead.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      description: Which component or service is affected?
+      options:
+        - API Gateway / REST API
+        - Agent Runtime
+        - Threat Detection Agent
+        - Incident Response Agent
+        - Log Analysis Agent
+        - Vulnerability Scanner Agent
+        - Orchestrator / Agent Manager
+        - Web UI / Dashboard
+        - Authentication / Authorization
+        - Data Pipeline / Ingestion
+        - Alert Manager
+        - Infrastructure / Terraform
+        - CI/CD Pipeline
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: How severe is this bug?
+      options:
+        - "Critical – System down or data loss"
+        - "High – Major functionality broken, no workaround"
+        - "Medium – Functionality impaired, workaround exists"
+        - "Low – Minor issue or cosmetic"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: "Describe the bug..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Provide detailed steps to reproduce the behavior.
+      placeholder: |
+        1. Send request to endpoint '...'
+        2. With payload '...'
+        3. Observe that '...'
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs or Error Output
+      description: |
+        Please paste any relevant log output, stack traces, or error messages.
+        **Remove any sensitive data (API keys, tokens, PII) before pasting.**
+      render: shell
+      placeholder: "Paste logs here..."
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / Commit SHA
+      description: Which version or commit SHA are you running?
+      placeholder: "e.g., v1.2.3 or abc1234"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      description: In which environment did you encounter this bug?
+      options:
+        - Production
+        - Staging
+        - Development
+        - Local
+        - CI/CD
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment-details
+    attributes:
+      label: Environment Details
+      description: Any additional environment details (OS, Python version, Docker version, cloud region, etc.)
+      placeholder: |
+        - OS: Ubuntu 22.04
+        - Python: 3.12.2
+        - Docker: 25.0.3
+        - AWS Region: us-east-1
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround
+      description: Have you found a workaround? If so, please describe it.
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Any other context, screenshots, or information that may be relevant.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true
+        - label: I have removed all sensitive data (secrets, tokens, PII) from this report.
+          required: true
+        - label: I have confirmed this is not a security vulnerability (use the Security Finding template for those).
+          required: true

@@ -1,0 +1,28 @@
+source_name: ai-agent-identity-governance
+version: "1.0"
+description: "Ingests identity and governance events from the AI Agent SOC identity broker and OPA policy engine"
+index_pattern: "soc-identity-governance-*"
+ingestion_method: opensearch_http_bulk
+endpoint: "https://opensearch.soc.internal:9200/_bulk"
+batch_size: 500
+flush_interval_seconds: 10
+fields_mapping:
+  timestamp:        "@timestamp"
+  agent_id:         "agent.id"
+  tenant_id:        "tenant.id"
+  tier:             "agent.tier"
+  event_type:       "event.action"
+  token_jti:        "identity.token.jti"
+  issued_at:        "identity.token.issued_at"
+  expires_at:       "identity.token.expires_at"
+  scopes:           "identity.token.scopes"
+  source_ip:        "source.ip"
+  response_code:    "http.response.status_code"
+  reason:           "event.reason"
+  revocation_reason:"identity.revocation.reason"
+retention_days: 365
+ilm_policy: "soc-identity-ilm-policy"
+tags:
+  - identity
+  - governance
+  - soc

@@ -1,0 +1,112 @@
+apiVersion: soar/v1
+kind: Playbook
+metadata:
+  name: revoke-session
+  description: "Revoke a compromised agent session to terminate unauthorized access"
+  severity_threshold: MEDIUM
+  auto_approve: false
+  timeout_seconds: 180
+  timeout_action: deny
+  tags:
+    - incident-response
+    - identity
+    - containment
+  version: "1.0"
+  author: "SOC Platform Team"
+spec:
+  steps:
+    - id: confirm_incident
+      name: "Confirm Incident Requires Session Revocation"
+      type: condition
+      condition: "incident.type in ['agent_token_theft', 'anomalous_behavior', 'policy_violation', 'ueba_critical']"
+      on_true: get_approval
+      on_false: abort
+      abort_message: "Session revocation not required for incident type {{ incident.type }}."
+
+    - id: get_approval
+      name: "Request T2 Approval for Session Revocation"
+      type: approval
+      required_role: T2
+      timeout_seconds: 180
+      timeout_action: deny
+      message: |
+        Approve revocation of session {{ incident.session_id }}?
+        Agent ID: {{ incident.agent_id }}
+        Incident ID: {{ incident.id }}
+        Severity: {{ incident.severity }}
+        Reason: {{ incident.type }}
+      on_approved: call_revoke_api
+      on_denied: abort
+
+    - id: call_revoke_api
+      name: "Revoke Agent Session via Identity API"
+      type: api_call
+      endpoint: "{{ env.SOC_API_URL }}/api/v1/sessions/{{ incident.session_id }}"
+      method: DELETE
+      auth: iam_role
+      body:
+        reason: "{{ incident.type }}"
+        incident_id: "{{ incident.id }}"
+        revoked_by: "{{ approval.approver_id }}"
+      retry:
+        max_attempts: 3
+        backoff_seconds: 3
+      on_success: verify_revocation
+      on_failure: notify_failure
+
+    - id: verify_revocation
+      name: "Verify Session Is Revoked"
+      type: api_call
+      endpoint: "{{ env.SOC_API_URL }}/api/v1/sessions/{{ incident.session_id }}/status"
+      method: GET
+      auth: iam_role
+      expected_result: "revoked"
+      retry:
+        max_attempts: 3
+        backoff_seconds: 5
+      on_success: notify_owner
+      on_failure: notify_failure
+
+    - id: notify_owner
+      name: "Notify Session Owner and SOC Team"
+      type: notification
+      channels:
+        - slack
+        - email
+      recipients:
+        - "{{ incident.owner_email }}"
+        - "soc-team@example.com"
+      message: |
+        Agent session {{ incident.session_id }} has been revoked.
+        Agent ID: {{ incident.agent_id }}
+        Incident: {{ incident.id }}
+        Reason: {{ incident.type }}
+        Revoked by: {{ approval.approver_id }}
+      on_complete: update_incident
+
+    - id: notify_failure
+      name: "Notify Revocation Failure"
+      type: notification
+      channels:
+        - slack
+        - pagerduty
+      recipients:
+        - "soc-team@example.com"
+        - "on-call@example.com"
+      message: |
+        FAILED to revoke session {{ incident.session_id }}.
+        Agent: {{ incident.agent_id }}
+        Manual intervention required immediately.
+      on_complete: abort
+
+    - id: update_incident
+      name: "Update Incident with Revocation Details"
+      type: api_call
+      endpoint: "{{ env.SOC_API_URL }}/api/v1/incidents/{{ incident.id }}"
+      method: PATCH
+      auth: iam_role
+      body:
+        status: "contained"
+        containment_action: "session_revoked"
+        containment_timestamp: "{{ now() }}"
+        containment_approver: "{{ approval.approver_id }}"

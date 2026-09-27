@@ -1,0 +1,277 @@
+name: Terraform
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      action:
+        description: "Terraform action"
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false  # Never cancel terraform jobs
+
+env:
+  TF_VERSION: "1.8.5"
+  TF_WORKING_DIR: "./infra"
+  # Terraform verbosity for CI (TRACE|DEBUG|INFO|WARN|ERROR)
+  TF_LOG: "INFO"
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Validate (always runs)
+  # ─────────────────────────────────────────────
+  validate:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+          working-directory: ${{ env.TF_WORKING_DIR }}
+
+  # ─────────────────────────────────────────────
+  # Job 2: Plan (runs on PR)
+  # ─────────────────────────────────────────────
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [validate]
+    if: github.event_name == 'pull_request'
+
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    strategy:
+      matrix:
+        environment: [dev, staging]
+
+    environment: ${{ matrix.environment }}-plan
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: TerraformPlan-${{ matrix.environment }}-${{ github.run_id }}
+
+      - name: Configure Azure credentials via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+          working-directory: ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}
+        env:
+          TF_VAR_environment: ${{ matrix.environment }}
+          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+          TF_VAR_azure_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          terraform plan \
+            -var-file="terraform.${{ matrix.environment }}.tfvars" \
+            -out=tfplan.${{ matrix.environment }} \
+            -input=false \
+            -no-color \
+            2>&1 | tee plan_output.txt
+
+          # Save exit code
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      - name: Upload Terraform plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}-${{ github.sha }}
+          path: |
+            ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}/tfplan.${{ matrix.environment }}
+            ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}/plan_output.txt
+          retention-days: 5
+
+      - name: Post plan as PR comment
+        uses: actions/github-script@v7
+        if: always()
+        env:
+          PLAN_OUTPUT_FILE: ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}/plan_output.txt
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync(process.env.PLAN_OUTPUT_FILE, 'utf8');
+
+            // Truncate if too long for a PR comment (GitHub limit ~65536 chars)
+            const maxLen = 60000;
+            const truncated = planOutput.length > maxLen
+              ? planOutput.slice(0, maxLen) + '\n\n... [truncated — see artifact for full plan]'
+              : planOutput;
+
+            const planStatus = '${{ steps.plan.outputs.exit_code }}' === '0' ? '✅ Success' : '❌ Failed';
+
+            const comment = `## Terraform Plan — \`${{ matrix.environment }}\` ${planStatus}
+
+            <details>
+            <summary>Show Plan Output</summary>
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+
+            </details>
+
+            *Triggered by: @${{ github.actor }} | Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`;
+
+            // Find existing bot comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' &&
+              c.body.includes(`Terraform Plan — \`${{ matrix.environment }}\``)
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment,
+              });
+            }
+
+  # ─────────────────────────────────────────────
+  # Job 3: Apply (runs on push to main)
+  # ─────────────────────────────────────────────
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [validate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    strategy:
+      # Apply environments sequentially: dev first, then staging, then prod
+      max-parallel: 1
+      matrix:
+        environment: [dev, staging]
+
+    environment: ${{ matrix.environment }}-apply
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: TerraformApply-${{ matrix.environment }}-${{ github.run_id }}
+
+      - name: Configure Azure credentials via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configure GCP credentials via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+          working-directory: ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}
+        env:
+          TF_VAR_environment: ${{ matrix.environment }}
+          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+          TF_VAR_azure_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          terraform apply \
+            -var-file="terraform.${{ matrix.environment }}.tfvars" \
+            -auto-approve \
+            -input=false \
+            -no-color
+
+      - name: Save Terraform outputs
+        id: tf-outputs
+        working-directory: ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}
+        run: |
+          terraform output -json > tf-outputs-${{ matrix.environment }}.json
+          echo "Terraform apply completed successfully for ${{ matrix.environment }}"
+
+      - name: Upload Terraform outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs-${{ matrix.environment }}-${{ github.sha }}
+          path: ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}/tf-outputs-${{ matrix.environment }}.json
+          retention-days: 30

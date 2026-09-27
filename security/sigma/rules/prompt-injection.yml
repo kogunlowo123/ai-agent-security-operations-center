@@ -1,0 +1,44 @@
+title: Prompt Injection Attack Detected in AI Agent
+id: a4c8e2d1-5f3b-4a7e-9c6d-8b2a1f4e3c7d
+status: stable
+description: |
+  Detects prompt injection attacks targeting AI agents. Triggered when the
+  runtime guardrails service reports a prompt injection attempt. Maps to
+  MITRE ATT&CK T1059 (Command and Scripting Interpreter).
+references:
+  - https://attack.mitre.org/techniques/T1059/
+  - https://owasp.org/www-project-top-10-for-large-language-model-applications/
+author: AI SOC Platform
+date: 2024/01/15
+modified: 2024/11/15
+tags:
+  - attack.execution
+  - attack.t1059
+  - ai.prompt_injection
+  - owasp.llm01
+logsource:
+  product: ai-agent-soc
+  service: runtime-guardrails
+  definition: CloudEvents from the ai-agent-runtime-guardrails upstream repository
+detection:
+  selection:
+    event_type: "runtime.guardrail.triggered"
+    payload.trigger_reason: "prompt_injection"
+  high_confidence:
+    payload.confidence_score|gt: 0.8
+  multi_attempt:
+    count(event_id)|timeframe|5m|gt: 3
+  condition: selection and (high_confidence or multi_attempt)
+falsepositives:
+  - Security red team exercises (coordinate with red team calendar)
+  - Testing environments with synthetic adversarial prompts
+level: high
+fields:
+  - principal_id
+  - payload.agent_id
+  - payload.model_name
+  - payload.prompt_hash
+  - payload.trigger_reason
+  - payload.confidence_score
+  - source_repo
+  - tenant_id

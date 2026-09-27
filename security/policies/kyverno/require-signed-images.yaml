@@ -1,0 +1,48 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+  annotations:
+    policies.kyverno.io/title: Require Signed Container Images
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Requires all container images to be signed using Cosign (sigstore).
+      Unsigned images from untrusted registries are rejected.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-image-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaceSelector:
+                matchExpressions:
+                  - key: kubernetes.io/metadata.name
+                    operator: NotIn
+                    values:
+                      - kube-system
+                      - cert-manager
+                      - kube-public
+      verifyImages:
+        - imageReferences:
+            - "*.dkr.ecr.*.amazonaws.com/*"
+            - "*.azurecr.io/*"
+            - "*.pkg.dev/*"
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    url: https://fulcio.sigstore.dev
+                    rekor:
+                      url: https://rekor.sigstore.dev
+                    identities:
+                      - issuerRegExp: "https://token.actions.githubusercontent.com"
+                        subjectRegExp: "https://github.com/kogunlowo123/ai-agent-security-operations-center/.github/workflows/.*"
+          mutateDigest: true
+          verifyDigest: true
+          required: true

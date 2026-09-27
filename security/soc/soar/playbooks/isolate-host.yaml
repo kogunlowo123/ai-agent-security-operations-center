@@ -1,0 +1,112 @@
+apiVersion: soar/v1
+kind: Playbook
+metadata:
+  name: isolate-host
+  description: "Isolate a compromised host from the network to prevent lateral movement"
+  severity_threshold: HIGH
+  auto_approve: false
+  timeout_seconds: 300
+  timeout_action: deny
+  tags:
+    - incident-response
+    - network
+    - containment
+  version: "1.0"
+  author: "SOC Platform Team"
+spec:
+  steps:
+    - id: confirm_incident_severity
+      name: "Confirm Incident Severity"
+      type: condition
+      condition: "incident.severity in ['CRITICAL', 'HIGH']"
+      on_true: get_approval
+      on_false: abort
+      abort_message: "Isolation skipped: severity {{ incident.severity }} is below HIGH threshold."
+
+    - id: get_approval
+      name: "Request T2 Approval"
+      type: approval
+      required_role: T2
+      timeout_seconds: 300
+      timeout_action: deny
+      message: |
+        Approve isolation of host {{ incident.host_id }}?
+        Incident ID: {{ incident.id }}
+        Severity: {{ incident.severity }}
+        Tenant: {{ incident.tenant_id }}
+        Detected threat: {{ incident.type }}
+      on_approved: call_api_isolate_host
+      on_denied: abort
+
+    - id: call_api_isolate_host
+      name: "Isolate Host via Network API"
+      type: api_call
+      endpoint: "{{ env.NETWORK_API_URL }}/v1/hosts/{{ incident.host_id }}/isolate"
+      method: POST
+      auth: iam_role
+      body:
+        reason: "{{ incident.type }}"
+        incident_id: "{{ incident.id }}"
+        initiated_by: "{{ approval.approver_id }}"
+      retry:
+        max_attempts: 3
+        backoff_seconds: 5
+      on_success: verify_isolation
+      on_failure: notify_failure
+
+    - id: verify_isolation
+      name: "Verify Host Is Isolated"
+      type: api_call
+      endpoint: "{{ env.NETWORK_API_URL }}/v1/hosts/{{ incident.host_id }}/status"
+      method: GET
+      auth: iam_role
+      expected_result: "isolated"
+      retry:
+        max_attempts: 5
+        backoff_seconds: 10
+      on_success: notify_owner
+      on_failure: notify_failure
+
+    - id: notify_owner
+      name: "Notify Incident Owner"
+      type: notification
+      channels:
+        - slack
+        - email
+      recipients:
+        - "{{ incident.owner_email }}"
+        - "soc-team@example.com"
+      message: |
+        Host {{ incident.host_id }} has been successfully isolated.
+        Incident: {{ incident.id }}
+        Severity: {{ incident.severity }}
+        Threat type: {{ incident.type }}
+        Approved by: {{ approval.approver_id }}
+      on_complete: update_incident
+
+    - id: notify_failure
+      name: "Notify Isolation Failure"
+      type: notification
+      channels:
+        - slack
+        - pagerduty
+      recipients:
+        - "soc-team@example.com"
+        - "on-call@example.com"
+      message: |
+        FAILED to isolate host {{ incident.host_id }}.
+        Incident: {{ incident.id }}
+        Manual intervention required.
+      on_complete: abort
+
+    - id: update_incident
+      name: "Update Incident Record"
+      type: api_call
+      endpoint: "{{ env.SOC_API_URL }}/api/v1/incidents/{{ incident.id }}"
+      method: PATCH
+      auth: iam_role
+      body:
+        status: "contained"
+        containment_action: "host_isolated"
+        containment_timestamp: "{{ now() }}"
+        containment_approver: "{{ approval.approver_id }}"

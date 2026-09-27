@@ -1,0 +1,28 @@
+source_name: ai-agent-policy-enforcement
+version: "1.0"
+description: "Ingests policy decision events from the OPA policy engine (allow/deny decisions)"
+index_pattern: "soc-policy-enforcement-*"
+ingestion_method: opensearch_http_bulk
+endpoint: "https://opensearch.soc.internal:9200/_bulk"
+batch_size: 1000
+flush_interval_seconds: 5
+fields_mapping:
+  timestamp:        "@timestamp"
+  decision_id:      "policy.decision_id"
+  policy_path:      "policy.path"
+  input_method:     "http.request.method"
+  input_path:       "url.path"
+  agent_id:         "agent.id"
+  tenant_id:        "tenant.id"
+  tier:             "agent.tier"
+  scopes:           "identity.token.scopes"
+  decision:         "policy.decision"
+  reason:           "policy.deny_reason"
+  latency_ms:       "event.duration"
+retention_days: 365
+ilm_policy: "soc-policy-ilm-policy"
+tags:
+  - policy
+  - opa
+  - authorization
+  - soc

@@ -1,0 +1,21 @@
+id: "a1b2c3d4-0001-0001-0001-000000000001"
+name: "soc-analyst"
+tier: "T1"
+owner:
+  team: "security-operations"
+  email: "soc-team@example.com"
+  cost_center: "CC-SEC-001"
+scopes:
+  - "events:ingest"
+  - "events:read"
+  - "incidents:read"
+  - "posture:read"
+created_at: "2025-01-01T00:00:00Z"
+expires_at: "2026-01-01T00:00:00Z"
+metadata:
+  description: "Tier-1 SOC analyst agent for event ingestion and incident monitoring"
+  deployment_region: "us-east-1"
+  llm_model: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+  max_concurrent_sessions: 5
+  approved_by: "security-lead@example.com"
+  approval_date: "2024-12-15T10:00:00Z"

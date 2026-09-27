@@ -1,0 +1,43 @@
+# CloudEvent → SOC canonical schema parser
+name: cloudevent-parser
+version: "1.0"
+description: "Parses CloudEvents v1.0 envelope and maps fields to the SOC canonical event schema"
+input_format: json
+output_format: json
+field_mappings:
+  # CloudEvents standard attributes
+  id:               "event.id"
+  source:           "event.source"
+  specversion:      "cloudevent.specversion"
+  type:             "event.action"
+  datacontenttype:  "http.request.mime_type"
+  dataschema:       "cloudevent.dataschema"
+  subject:          "event.subject"
+  time:             "@timestamp"
+  # CloudEvents extension attributes (SOC-specific)
+  tenant_id:        "tenant.id"
+  agent_id:         "agent.id"
+  trace_id:         "trace.id"
+  span_id:          "span.id"
+  # Data payload fields (unpacked from `data`)
+  data.severity:    "event.severity"
+  data.category:    "event.category"
+  data.outcome:     "event.outcome"
+  data.payload:     "event.original"
+transformations:
+  - field: "@timestamp"
+    operation: parse_iso8601
+  - field: "event.severity"
+    operation: uppercase
+  - field: "event.outcome"
+    operation: map
+    mapping:
+      success: "success"
+      failure: "failure"
+      unknown: "unknown"
+      "0":     "success"
+      "1":     "failure"
+error_handling:
+  on_missing_required_field: drop_and_log
+  on_parse_error: dead_letter_queue
+  dead_letter_index: "soc-parse-errors-*"

@@ -1,0 +1,21 @@
+{
+  "AlarmName": "BedrockInvokeSpike",
+  "AlarmDescription": "Triggers when the number of Bedrock model invocations exceeds 1000 in a 5-minute window, which may indicate runaway agent loops, token budget exhaustion, or denial-of-wallet attacks.",
+  "ActionsEnabled": true,
+  "AlarmActions": [
+    "arn:aws:sns:us-east-1:123456789012:soc-alerts-critical"
+  ],
+  "OKActions": [
+    "arn:aws:sns:us-east-1:123456789012:soc-alerts-ok"
+  ],
+  "MetricName": "InvokeModel",
+  "Namespace": "AWS/Bedrock",
+  "Statistic": "Sum",
+  "Dimensions": [],
+  "Period": 300,
+  "EvaluationPeriods": 1,
+  "DatapointsToAlarm": 1,
+  "Threshold": 1000,
+  "ComparisonOperator": "GreaterThanThreshold",
+  "TreatMissingData": "notBreaching"
+}

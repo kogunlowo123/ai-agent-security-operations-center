@@ -1,0 +1,59 @@
+# Gateway routing rules
+# Defines how requests are routed to providers with fallback logic
+version: "1.0"
+
+routing_rules:
+  # Production traffic → Bedrock primary, Vertex AI fallback
+  - name: production-default
+    priority: 100
+    match:
+      environment: production
+    primary:
+      model: claude-3-5-sonnet
+      provider: bedrock
+      region: us-east-1
+    fallback:
+      model: vertex-gemini-pro
+      provider: vertex_ai
+      region: us-central1
+    conditions:
+      - trigger: primary_unavailable
+        action: use_fallback
+      - trigger: primary_latency_ms_gt
+        threshold: 30000
+        action: use_fallback
+      - trigger: primary_error_rate_pct_gt
+        threshold: 10
+        window_minutes: 5
+        action: use_fallback
+
+  # High-priority incidents → direct to Bedrock, no fallback
+  - name: incident-priority
+    priority: 200
+    match:
+      request_header_x_soc_priority: "CRITICAL"
+    primary:
+      model: claude-3-5-sonnet
+      provider: bedrock
+      region: us-east-1
+    fallback: null
+    timeout_seconds: 60
+
+  # Cost-optimized low-priority tasks → Haiku first
+  - name: low-priority-cost-optimized
+    priority: 50
+    match:
+      request_header_x_soc_priority: "LOW"
+    primary:
+      model: claude-3-haiku
+      provider: bedrock
+      region: us-east-1
+    fallback:
+      model: vertex-gemini-flash
+      provider: vertex_ai
+
+load_balancing:
+  strategy: least_busy           # round_robin | least_busy | latency_based
+  health_check_interval_seconds: 30
+  unhealthy_threshold: 3
+  healthy_threshold: 2

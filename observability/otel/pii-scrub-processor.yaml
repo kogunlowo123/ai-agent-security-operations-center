@@ -1,0 +1,72 @@
+name: pii-scrub-processor
+description: >
+  OpenTelemetry Transform processor rules for PII and credential scrubbing.
+  Applied to all traces, logs, and metrics before export to Tempo / OpenSearch.
+
+version: "1.0"
+otel_component: transform
+
+# These rules are referenced by collector.yaml transform/pii_scrub.
+# Keep in sync with the actual processor config.
+
+patterns:
+  credentials:
+    - name: bearer_token
+      pattern: "(?i)bearer [a-zA-Z0-9._\\-]+"
+      replacement: "Bearer [REDACTED_TOKEN]"
+      contexts: [trace.span.attribute, log.body, log.attribute]
+
+    - name: api_key_inline
+      pattern: "(?i)(api.?key|x-api-key|apikey)[\":=\\s]+[a-zA-Z0-9._\\-]{20,}"
+      replacement: "$1: [REDACTED_KEY]"
+      contexts: [log.body, log.attribute]
+
+    - name: aws_access_key
+      pattern: "(?i)(AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}"
+      replacement: "[REDACTED_AWS_KEY]"
+      contexts: [trace.span.attribute, log.body]
+
+    - name: aws_secret_key
+      pattern: "(?i)aws_secret[_a-z]*[\"\\s:=]+[a-zA-Z0-9/+]{40}"
+      replacement: "aws_secret_access_key: [REDACTED]"
+      contexts: [trace.span.attribute, log.body]
+
+  personal_data:
+    - name: email_address
+      pattern: "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}"
+      replacement: "[REDACTED_EMAIL]"
+      contexts: [log.body, trace.span.attribute]
+      exceptions:
+        - field: "http.url"
+          note: "URLs may contain email-like strings; exclude from replacement"
+
+    - name: principal_id_full
+      pattern: "^usr_[a-z0-9]{8}[a-z0-9\\-]+"
+      replacement: "usr_[REDACTED]"
+      contexts: [trace.span.attribute]
+      attribute_keys: [principal_id]
+
+  financial:
+    - name: card_number
+      pattern: "\\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\\b"
+      replacement: "[REDACTED_CARD]"
+      contexts: [log.body]
+
+fields_always_drop:
+  - password
+  - secret
+  - private_key
+  - client_secret
+  - authorization
+
+fields_hash_not_drop:
+  - user_agent
+  - ip_address
+  - source_ip
+  hash_algorithm: sha256
+  prefix: "hash:"
+
+retention_after_scrub:
+  traces: 30d
+  logs: 90d
+  metrics: 365d

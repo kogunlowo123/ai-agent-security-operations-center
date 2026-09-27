@@ -1,0 +1,82 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-containers
+  annotations:
+    policies.kyverno.io/title: Disallow Privileged Containers
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod,Container,InitContainer,EphemeralContainer
+    policies.kyverno.io/description: >-
+      Privileged mode disables most container security features.
+      This policy prevents containers from running in privileged mode,
+      accessing host namespaces, or mounting host paths.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: disallow-privileged-mode
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Privileged containers are not allowed."
+        pattern:
+          spec:
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+            =(ephemeralContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+
+    - name: disallow-host-namespaces
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Host namespaces (hostPID, hostIPC, hostNetwork) are not allowed."
+        pattern:
+          spec:
+            =(hostPID): "false"
+            =(hostIPC): "false"
+            =(hostNetwork): "false"
+
+    - name: disallow-host-path-volumes
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "hostPath volumes are not allowed."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.volumes[].hostPath | length(@) }}"
+                operator: GreaterThan
+                value: 0
+
+    - name: require-run-as-non-root
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaceSelector:
+                matchExpressions:
+                  - key: kubernetes.io/metadata.name
+                    operator: NotIn
+                    values: [kube-system, kube-public]
+      validate:
+        message: "Containers must run as non-root. Set securityContext.runAsNonRoot=true."
+        pattern:
+          spec:
+            =(securityContext):
+              =(runAsNonRoot): true
+            containers:
+              - =(securityContext):
+                  =(runAsNonRoot): true

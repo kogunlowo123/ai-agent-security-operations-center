@@ -1,0 +1,33 @@
+# CODEOWNERS
+# Each line is a file pattern followed by one or more owners.
+# Order matters: the LAST matching pattern takes precedence.
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# ── Global default: @kogunlowo123 owns everything ───────────────────────────
+*                           @kogunlowo123
+
+# ── Infrastructure ──────────────────────────────────────────────────────────
+/infra/                     @kogunlowo123
+/terraform/                 @kogunlowo123
+/.github/                   @kogunlowo123
+
+# ── Services ────────────────────────────────────────────────────────────────
+/services/                  @kogunlowo123
+/services/api/              @kogunlowo123
+/services/agents/           @kogunlowo123
+/services/ingest/           @kogunlowo123
+
+# ── Source ──────────────────────────────────────────────────────────────────
+/src/                       @kogunlowo123
+
+# ── Tests ───────────────────────────────────────────────────────────────────
+/tests/                     @kogunlowo123
+
+# ── Docs ────────────────────────────────────────────────────────────────────
+/docs/                      @kogunlowo123
+
+# ── Root config files ───────────────────────────────────────────────────────
+Makefile                    @kogunlowo123
+docker-compose*.yml         @kogunlowo123
+.pre-commit-config.yaml     @kogunlowo123
+pyproject.toml              @kogunlowo123

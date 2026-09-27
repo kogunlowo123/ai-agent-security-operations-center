@@ -1,0 +1,88 @@
+---
+# =============================================================================
+# AI Agent Security Operations Center — Development Overrides
+#
+# Usage:
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#
+# Docker Compose automatically merges docker-compose.override.yml on top of
+# docker-compose.yml when you run `docker compose up`.
+#
+# This file mounts local source trees into each service container so that
+# code changes are picked up without rebuilding the image (hot reload).
+# =============================================================================
+name: ai-agent-soc
+
+services:
+  # ── API — hot reload via uvicorn --reload ────────────────────────────────────
+  api:
+    build:
+      target: development
+    command: uvicorn services.api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir services/api --reload-dir src
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: DEBUG
+      # Disable auth verification in local dev if needed
+      # DISABLE_AUTH: "true"
+    volumes:
+      - ./services/api:/app/services/api
+      - ./src:/app/src
+      - ./tests:/app/tests
+    ports:
+      - "8000:8000"
+      - "5678:5678"   # debugpy remote debug port
+
+  # ── Agent Runtime — hot reload via watchfiles ─────────────────────────────────
+  agents:
+    build:
+      target: development
+    command: python -m watchfiles "python -m services.agents.runner" services/agents src
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./services/agents:/app/services/agents
+      - ./src:/app/src
+
+  # ── Ingest Pipeline — hot reload ─────────────────────────────────────────────
+  ingest:
+    build:
+      target: development
+    command: uvicorn services.ingest.main:app --host 0.0.0.0 --port 8001 --reload --reload-dir services/ingest --reload-dir src
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./services/ingest:/app/services/ingest
+      - ./src:/app/src
+    ports:
+      - "8001:8001"
+      - "5679:5679"   # debugpy remote debug port
+
+  # ── Postgres — expose on a non-default local port to avoid conflicts ──────────
+  postgres:
+    ports:
+      - "15432:5432"
+
+  # ── OpenSearch Dashboards — allow wider origins for local dev ─────────────────
+  opensearch-dashboards:
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+      SERVER_BASEPATH: ""
+
+  # ── Redis — expose so you can inspect with redis-cli locally ─────────────────
+  redis:
+    ports:
+      - "6379:6379"
+
+  # ── OTel Collector — expose Jaeger UI via the collector's debug port ──────────
+  otel-collector:
+    environment:
+      LOG_LEVEL: debug
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8888:8888"
+      - "8889:8889"
+      - "55679:55679"  # zpages debug UI

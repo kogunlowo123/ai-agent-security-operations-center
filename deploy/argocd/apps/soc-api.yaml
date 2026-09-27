@@ -1,0 +1,42 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: soc-api
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/name: soc-api
+    app.kubernetes.io/part-of: ai-agent-soc
+    tier: api
+spec:
+  project: ai-agent-soc
+  source:
+    repoURL: https://github.com/kogunlowo123/ai-agent-security-operations-center.git
+    targetRevision: main
+    path: deploy/helm/charts/soc-api
+    helm:
+      releaseName: soc-api
+      valueFiles:
+        - values.yaml
+        - ../../envs/prod/soc-api-values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ai-agent-soc
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 2m
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas  # KEDA manages this

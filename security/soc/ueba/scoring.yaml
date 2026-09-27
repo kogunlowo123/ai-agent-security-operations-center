@@ -1,0 +1,46 @@
+# UEBA Risk Scoring Configuration
+version: "1.0"
+description: "Weights and thresholds for computing agent risk scores"
+
+scoring:
+  max_score: 100
+  decay_half_life_hours: 24
+  recalculation_interval_seconds: 300
+
+  signal_weights:
+    off_hours_access:           15
+    failed_auth_attempts:       10
+    scope_denied_count:         12
+    cross_tenant_attempt:       25
+    hunt_launch_rate_excess:    20
+    event_ingest_rate_excess:    8
+    session_duration_excess:     5
+    consecutive_errors:          5
+
+  tier_modifiers:
+    T1: 1.0
+    T2: 1.5   # Higher weight — more powerful operations
+    T3: 2.0
+
+  risk_levels:
+    LOW:
+      min_score: 0
+      max_score: 29
+      action: "monitor"
+    MEDIUM:
+      min_score: 30
+      max_score: 59
+      action: "alert_soc"
+    HIGH:
+      min_score: 60
+      max_score: 79
+      action: "alert_soc_and_throttle"
+    CRITICAL:
+      min_score: 80
+      max_score: 100
+      action: "alert_soc_suspend_session"
+
+persistence:
+  backend: redis
+  key_prefix: "ueba:score:"
+  ttl_seconds: 86400

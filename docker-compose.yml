@@ -1,0 +1,264 @@
+---
+# =============================================================================
+# AI Agent Security Operations Center — Docker Compose
+# Production-like local stack with all services.
+# =============================================================================
+name: ai-agent-soc
+
+x-common-env: &common-env
+  APP_ENV: ${APP_ENV:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+  OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-ai-agent-soc}
+
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+
+services:
+  # ── API Gateway ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+      target: production
+    image: ai-agent-soc-api:local
+    container_name: soc-api
+    <<: *restart-policy
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      <<: *common-env
+      APP_PORT: "8000"
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      DATABASE_URL: postgresql://soc_user:soc_password@postgres:5432/soc_db
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      OPENSEARCH_URL: http://opensearch:9200
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-change-me}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_BEDROCK_MODEL_ID: ${AWS_BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - soc-internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - api-logs:/app/logs
+
+  # ── Agent Runtime ────────────────────────────────────────────────────────────
+  agents:
+    build:
+      context: .
+      dockerfile: services/agents/Dockerfile
+      target: production
+    image: ai-agent-soc-agents:local
+    container_name: soc-agents
+    <<: *restart-policy
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgresql://soc_user:soc_password@postgres:5432/soc_db
+      OPENSEARCH_URL: http://opensearch:9200
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-change-me}
+      REDIS_URL: redis://redis:6379/0
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_BEDROCK_MODEL_ID: ${AWS_BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      VERTEX_PROJECT: ${VERTEX_PROJECT:-}
+      VERTEX_LOCATION: ${VERTEX_LOCATION:-us-central1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - soc-internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Ingest Pipeline ──────────────────────────────────────────────────────────
+  ingest:
+    build:
+      context: .
+      dockerfile: services/ingest/Dockerfile
+      target: production
+    image: ai-agent-soc-ingest:local
+    container_name: soc-ingest
+    <<: *restart-policy
+    ports:
+      - "8001:8001"
+    environment:
+      <<: *common-env
+      INGEST_PORT: "8001"
+      DATABASE_URL: postgresql://soc_user:soc_password@postgres:5432/soc_db
+      OPENSEARCH_URL: http://opensearch:9200
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-change-me}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - soc-internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ── Postgres + pgvector ──────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: soc-postgres
+    <<: *restart-policy
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: soc_user
+      POSTGRES_PASSWORD: soc_password
+      POSTGRES_DB: soc_db
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - soc-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soc_user -d soc_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── OpenSearch ───────────────────────────────────────────────────────────────
+  opensearch:
+    image: opensearchproject/opensearch:2.14.0
+    container_name: soc-opensearch
+    <<: *restart-policy
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    environment:
+      cluster.name: soc-cluster
+      node.name: soc-node-1
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_PASSWORD:-change-me}
+      plugins.security.ssl.http.enabled: "false"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - soc-internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.14.0
+    container_name: soc-opensearch-dashboards
+    <<: *restart-policy
+    ports:
+      - "5601:5601"
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    networks:
+      - soc-internal
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: soc-redis
+    <<: *restart-policy
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save 60 1
+    volumes:
+      - redis-data:/data
+    networks:
+      - soc-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ── OpenTelemetry Collector ───────────────────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    container_name: soc-otel-collector
+    <<: *restart-policy
+    ports:
+      - "4317:4317"    # OTLP gRPC receiver
+      - "4318:4318"    # OTLP HTTP receiver
+      - "8888:8888"    # Prometheus metrics
+      - "8889:8889"    # Prometheus exporter
+    volumes:
+      - ./infra/otel/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks:
+      - soc-internal
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:13133/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  soc-internal:
+    driver: bridge
+    name: soc-internal
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres-data:
+    name: soc-postgres-data
+  opensearch-data:
+    name: soc-opensearch-data
+  redis-data:
+    name: soc-redis-data
+  api-logs:
+    name: soc-api-logs

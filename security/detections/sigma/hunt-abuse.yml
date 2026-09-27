@@ -1,0 +1,35 @@
+title: Excessive Threat Hunt Launches
+id: b9f24a73-1c5e-4d89-a023-7e4b6f19d2c8
+status: stable
+description: >
+  Detects when a single principal launches more than 10 threat hunt operations
+  within a 1-hour window. This may indicate an automated abuse of the hunt
+  capability, a compromised T2/T3 agent token, or a runaway automated workflow.
+references:
+  - https://attack.mitre.org/techniques/T1595/
+author: AI Agent SOC Security Team
+date: 2025-01-01
+modified: 2025-01-01
+tags:
+  - attack.reconnaissance
+  - attack.T1595
+  - soc.hunt_abuse
+logsource:
+  product: opensearch
+  service: soc-events
+detection:
+  selection:
+    event_type: "hunt:launch"
+    status: "success"
+  timeframe: 1h
+  condition: selection | count() by agent_id > 10
+fields:
+  - agent_id
+  - tenant_id
+  - hunt_id
+  - hunt_query
+  - timestamp
+falsepositives:
+  - Automated threat hunting pipelines with explicit approval
+  - Security exercises with pre-authorized high-volume hunts
+level: high

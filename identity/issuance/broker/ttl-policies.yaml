@@ -1,0 +1,38 @@
+# TTL policies per agent tier
+# Defines default and maximum token lifetimes and renewal rules.
+version: "1.0"
+policies:
+  T1:
+    description: "Tier-1 analyst agents — low privilege, short-lived tokens"
+    default_ttl_seconds: 3600        # 1 hour
+    max_ttl_seconds: 14400           # 4 hours
+    renewal_allowed: true
+    max_renewals: 3
+    requires_mfa: false
+    idle_timeout_seconds: 1800       # 30 minutes
+
+  T2:
+    description: "Tier-2 elevated agents — medium privilege, controlled renewal"
+    default_ttl_seconds: 1800        # 30 minutes
+    max_ttl_seconds: 7200            # 2 hours
+    renewal_allowed: true
+    max_renewals: 1
+    requires_mfa: true
+    idle_timeout_seconds: 900        # 15 minutes
+    approval_required_for_renewal: true
+
+  T3:
+    description: "Tier-3 administrative agents — highest privilege, single-use tokens"
+    default_ttl_seconds: 900         # 15 minutes
+    max_ttl_seconds: 1800            # 30 minutes
+    renewal_allowed: false
+    max_renewals: 0
+    requires_mfa: true
+    idle_timeout_seconds: 300        # 5 minutes
+    dual_approval_required: true
+    audit_every_action: true
+
+global:
+  clock_skew_tolerance_seconds: 30
+  revocation_check_enabled: true
+  revocation_cache_ttl_seconds: 60
