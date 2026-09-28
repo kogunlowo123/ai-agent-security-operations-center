@@ -21,6 +21,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from api.middleware.auth import JWTAuthMiddleware
 from api.routes.v1.events import router as events_router
 from api.routes.v1.health import router as health_router
 from api.routes.v1.hunt import router as hunt_router
@@ -177,6 +178,7 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type", "X-Tenant-ID", "X-Request-ID"],
     )
+    app.add_middleware(JWTAuthMiddleware)
 
     # OTel auto-instrumentation
     FastAPIInstrumentor.instrument_app(app)

@@ -223,8 +223,23 @@ async def update_incident(
     return _row_to_incident(row)
 
 
+def _normalize_mitre_techniques(raw: list) -> list:
+    """Convert mixed list of strings/dicts to MitreTechnique-compatible dicts."""
+    result = []
+    for item in raw:
+        if isinstance(item, str):
+            result.append({"technique_id": item})
+        elif isinstance(item, dict):
+            result.append(item)
+        else:
+            result.append(item)
+    return result
+
+
 def _row_to_incident(row: dict) -> Incident:
     """Convert a database row to an Incident schema object."""
+    raw_techniques = row.get("mitre_techniques") or []
+    mitre_techniques = _normalize_mitre_techniques(raw_techniques)
     return Incident(
         id=row["id"],
         title=row["title"],
@@ -235,7 +250,7 @@ def _row_to_incident(row: dict) -> Incident:
         principal_id=row["principal_id"],
         source_event_id=row["source_event_id"],
         source_repo=row.get("source_repo", ""),
-        mitre_techniques=row.get("mitre_techniques") or [],
+        mitre_techniques=mitre_techniques,
         analysis=row.get("analysis"),
         verdict=row.get("verdict"),
         citations=row.get("citations") or [],

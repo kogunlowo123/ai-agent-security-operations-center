@@ -34,8 +34,8 @@ class MitreTechnique(BaseModel):
     """MITRE ATT&CK technique reference."""
 
     technique_id: str = Field(..., description="ATT&CK technique ID, e.g. T1078")
-    tactic: str = Field(..., description="Parent tactic name")
-    name: str = Field(..., description="Technique name")
+    tactic: Optional[str] = Field(None, description="Parent tactic name")
+    name: Optional[str] = Field(None, description="Technique name")
     description: Optional[str] = Field(None, description="Brief description")
     url: Optional[str] = Field(None, description="Link to ATT&CK technique page")
 
