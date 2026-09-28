@@ -107,7 +107,7 @@ jobs:
           ls -lh dist/
 
       - name: Upload distribution artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-dist-${{ needs.prepare.outputs.semver }}
           path: dist/
@@ -213,7 +213,7 @@ jobs:
           git push origin HEAD:main
 
       - name: Save changelog for release notes
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: changelog-${{ needs.prepare.outputs.semver }}
           path: CHANGES_LATEST.md

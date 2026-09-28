@@ -129,7 +129,7 @@ jobs:
           echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
 
       - name: Upload Terraform plan artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tfplan-${{ matrix.environment }}-${{ github.sha }}
           path: |
@@ -270,7 +270,7 @@ jobs:
           echo "Terraform apply completed successfully for ${{ matrix.environment }}"
 
       - name: Upload Terraform outputs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tf-outputs-${{ matrix.environment }}-${{ github.sha }}
           path: ${{ env.TF_WORKING_DIR }}/${{ matrix.environment }}/tf-outputs-${{ matrix.environment }}.json
